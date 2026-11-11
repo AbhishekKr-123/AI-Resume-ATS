@@ -19,8 +19,10 @@ class ApiError(RuntimeError):
 
 
 class ApiClient:
-    def __init__(self, base_url: str, timeout_seconds: float = 90, client: httpx.Client | None = None) -> None:
+    def __init__(self, base_url: str, timeout_seconds: float = 90, client: httpx.Client | None = None, session_id: str | None = None, session_cookie_name: str = "ats_session_dev") -> None:
         self._client = client or httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout_seconds)
+        self._session_id = session_id
+        self._session_cookie_name = session_cookie_name
 
     @staticmethod
     def content_type(filename: str) -> str:
@@ -34,12 +36,16 @@ class ApiClient:
         return base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii")
 
     @staticmethod
-    def _headers(filename: str | None = None, job_description: str | None = None, token: str | None = None) -> dict[str, str]:
+    def _headers(filename: str | None = None, job_description: str | None = None, token: str | None = None, session_id: str | None = None, session_cookie_name: str = "ats_session_dev") -> dict[str, str]:
         headers: dict[str, str] = {}
         if filename: headers["X-Upload-Filename-Base64"] = ApiClient._encode_header(filename)
         if job_description is not None: headers["X-Job-Description-Base64"] = ApiClient._encode_header(job_description)
         if token: headers["Authorization"] = f"Bearer {token}"
+        elif session_id: headers["Cookie"] = f"{session_cookie_name}={session_id}"
         return headers
+
+    def _auth_headers(self, filename: str | None = None, job_description: str | None = None, token: str | None = None) -> dict[str, str]:
+        return self._headers(filename, job_description, token, self._session_id, self._session_cookie_name)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         try:
@@ -57,12 +63,12 @@ class ApiClient:
         return payload
 
     def analyze(self, file_bytes: bytes, filename: str, job_description: str, token: str | None = None) -> dict:
-        headers = self._headers(filename, job_description, token)
+        headers = self._auth_headers(filename, job_description, token)
         headers["Content-Type"] = self.content_type(filename)
         return self._request("POST", "/resumes/analyze", content=file_bytes, headers=headers)
 
     def feedback(self, file_bytes: bytes, filename: str, job_description: str, token: str | None = None) -> dict:
-        headers = self._headers(filename, job_description, token)
+        headers = self._auth_headers(filename, job_description, token)
         headers["Content-Type"] = self.content_type(filename)
         return self._request("POST", "/resumes/feedback", content=file_bytes, headers=headers)
 
@@ -72,11 +78,14 @@ class ApiClient:
     def health_ready(self) -> dict:
         return self._request("GET", "/health/ready")
 
-    def history(self, token: str, limit: int = 20, offset: int = 0) -> dict:
-        return self._request("GET", "/analyses", headers=self._headers(token=token), params={"limit": limit, "offset": offset})
+    def session(self) -> dict:
+        return self._request("GET", "/auth/session", headers=self._auth_headers())
 
-    def get_analysis(self, analysis_id: str, token: str) -> dict:
-        return self._request("GET", f"/analyses/{analysis_id}", headers=self._headers(token=token))
+    def history(self, token: str | None, limit: int = 20, offset: int = 0) -> dict:
+        return self._request("GET", "/analyses", headers=self._auth_headers(token=token), params={"limit": limit, "offset": offset})
 
-    def delete_analysis(self, analysis_id: str, token: str) -> dict:
-        return self._request("DELETE", f"/analyses/{analysis_id}", headers=self._headers(token=token))
+    def get_analysis(self, analysis_id: str, token: str | None) -> dict:
+        return self._request("GET", f"/analyses/{analysis_id}", headers=self._auth_headers(token=token))
+
+    def delete_analysis(self, analysis_id: str, token: str | None) -> dict:
+        return self._request("DELETE", f"/analyses/{analysis_id}", headers=self._auth_headers(token=token))

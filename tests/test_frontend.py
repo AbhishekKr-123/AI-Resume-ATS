@@ -6,9 +6,9 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from frontend.api_client import ApiClient, ApiError, DOCX_MIME, PDF_MIME
-from frontend.app import _history_analysis, _render_password_reset, _validate_upload, check_backend
+from frontend.app import PAGES, _browser_logout_html, _history_analysis, _render_password_reset, _validate_upload, check_backend
 from frontend.auth import AuthError, SupabaseAuth, _safe_auth_message, _safe_diagnostic_message, clear_session, normalize_email
-from frontend.config import is_publishable_key, load_frontend_settings
+from frontend.config import FrontendSettings, is_publishable_key, load_frontend_settings
 from frontend.oauth_storage import OAuthFlowStorage, consume_verifier
 
 
@@ -22,6 +22,17 @@ def reset_form_app() -> None:
             st.session_state.reset_calls = [*calls, email]
 
     _render_password_reset(ResetAuthStub())
+
+
+def navigation_query_app() -> None:
+    import streamlit as st
+    from frontend.app import PAGES, _page_from_query, _set_page
+
+    current = _page_from_query()
+    page = st.radio("Navigation", PAGES, index=PAGES.index(current))
+    if page != current:
+        _set_page(page)
+    st.write(f"Selected: {page}")
 
 
 def response_handler(request: httpx.Request) -> httpx.Response:
@@ -40,6 +51,67 @@ def test_api_client_sends_raw_pdf_with_required_headers():
     client = ApiClient("https://api.test", client=httpx.Client(transport=httpx.MockTransport(response_handler), base_url="https://api.test"))
     result = client.analyze(b"raw-pdf-bytes", "resume.pdf", "Python role", "access-token")
     assert result["analysis"]["overall_ats_score"] == 81
+
+
+def test_api_client_forwards_only_opaque_session_cookie_when_no_bearer_token():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/auth/session"
+        assert request.headers["cookie"] == "ats_session_dev=opaque-session-id"
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json={"authenticated": True, "email": "user@example.test"})
+
+    client = ApiClient(
+        "https://api.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.test"),
+        session_id="opaque-session-id",
+    )
+    assert client.session()["authenticated"] is True
+
+
+def test_browser_logout_script_preserves_secure_post_and_top_level_navigation():
+    settings = FrontendSettings(
+        api_base_url="https://ats.example.test/api",
+        supabase_url=None,
+        supabase_publishable_key=None,
+        max_upload_bytes=1024,
+        oauth_redirect_url="https://ats.example.test",
+        auth_public_url="https://ats.example.test",
+    )
+    script = _browser_logout_html(settings, "csrf-value")
+    assert 'fetch("https://ats.example.test/auth/logout"' in script
+    assert "method: 'POST'" in script
+    assert "credentials: 'include'" in script
+    assert "'X-CSRF-Token': \"csrf-value\"" in script
+    assert "if (!response.ok) throw new Error('logout failed')" in script
+    assert 'if (success) window.location.replace("https://ats.example.test")' in script
+    assert "window.parent.location" not in script
+
+
+def test_browser_logout_script_handles_http_and_network_failures_before_navigation():
+    settings = FrontendSettings("https://api.test", None, None, 1024, auth_public_url="https://auth.test")
+    script = _browser_logout_html(settings, "csrf-value")
+    failure = "Sign-out could not be completed. Reload and try again."
+    assert ".catch(function()" in script
+    assert failure in script
+    assert "return false;" in script
+    assert script.index(".catch(function()") < script.index(".then(function(success)")
+    assert script.index(failure) < script.index("if (success) window.location.replace")
+
+
+def test_browser_logout_script_json_encodes_dynamic_values_for_html_script_context():
+    settings = FrontendSettings(
+        "https://api.test",
+        None,
+        None,
+        1024,
+        oauth_redirect_url="https://app.test/</script><script>redirect()",
+        auth_public_url="https://auth.test/</script><script>logout()",
+    )
+    script = _browser_logout_html(settings, "csrf</script><script>value")
+    assert "<script>redirect()" not in script
+    assert "<script>logout()" not in script
+    assert "csrf</script>" not in script
+    assert "\\u003c/script\\u003e\\u003cscript\\u003e" in script
 
 
 def test_api_client_sends_raw_docx_and_rejects_unsupported_file():
@@ -205,6 +277,37 @@ def test_invalid_reset_email_does_not_call_reset_method():
     assert len(app.exception) == 0
     assert "reset_calls" not in app.session_state
     assert app.error[0].value == "Enter a valid email address."
+
+
+@pytest.mark.parametrize("page", PAGES)
+def test_navigation_restores_each_valid_page_from_query_parameter(page):
+    app = AppTest.from_function(navigation_query_app)
+    app.query_params["page"] = page
+    app.run()
+    assert len(app.exception) == 0
+    assert app.radio[0].value == page
+    assert app.markdown[0].value == f"Selected: {page}"
+
+
+@pytest.mark.parametrize("query_params", [{}, {"page": "Not a real page"}, {"page": "dashboard"}])
+def test_navigation_defaults_to_dashboard_for_missing_or_invalid_page(query_params):
+    app = AppTest.from_function(navigation_query_app)
+    app.query_params.update(query_params)
+    app.run()
+    assert len(app.exception) == 0
+    assert app.radio[0].value == "Dashboard"
+    assert app.markdown[0].value == "Selected: Dashboard"
+
+
+def test_sidebar_navigation_updates_url_without_rerun_loop():
+    app = AppTest.from_function(navigation_query_app).run()
+    app.radio[0].set_value("Analysis History").run()
+    assert len(app.exception) == 0
+    assert app.query_params["page"] == "Analysis History"
+    assert app.radio[0].value == "Analysis History"
+    app.run()
+    assert len(app.exception) == 0
+    assert app.radio[0].value == "Analysis History"
 
 
 def test_auth_wraps_provider_errors_without_leaking_details(monkeypatch):

@@ -7,14 +7,17 @@ import binascii
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
+from urllib.parse import urlsplit
 
 import anyio
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .config import ConfigurationError, Settings, load_settings
 from .auth import optional_authenticated_user, require_authenticated_user
+from .auth_routes import OAuthProvider, RedactOAuthAccessLog, SupabaseOAuthProvider, create_auth_router
 from .database_service import AuthenticatedUser, DatabaseError, SupabaseService
 from .feedback_service import FeedbackError, GroqFeedbackService
 from .ingestion import (
@@ -28,6 +31,8 @@ from .model_service import LocalModelService, ModelLoadError
 from .rate_limit import RequestRateLimiter
 from .scoring.ats_scorer import ATSScorer
 from .text_processing import detect_resume_sections, preprocess_job_description
+from .oauth_flow_store import OAuthFlowStore
+from .session_service import SessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +91,9 @@ def create_app(
     model_service: LocalModelService | None = None,
     feedback_service: GroqFeedbackService | None = None,
     supabase_service: SupabaseService | None = None,
+    oauth_provider: OAuthProvider | None = None,
+    oauth_flow_store: OAuthFlowStore | None = None,
+    session_store: SessionStore | None = None,
 ) -> FastAPI:
     """Create the API, loading the local model once within its lifespan."""
     resolved_settings = settings or load_settings()
@@ -93,6 +101,18 @@ def create_app(
     configured_feedback_service = feedback_service
     configured_supabase_service = supabase_service
     analysis_limiter = RequestRateLimiter(resolved_settings.analysis_rate_limit_requests, resolved_settings.analysis_rate_limit_window_seconds)
+    configured_flow_store = oauth_flow_store or OAuthFlowStore()
+    configured_session_store = session_store or SessionStore(
+        idle_ttl_seconds=resolved_settings.auth_session_idle_seconds,
+        absolute_ttl_seconds=resolved_settings.auth_session_absolute_seconds,
+        refresh_skew_seconds=resolved_settings.auth_refresh_skew_seconds,
+    )
+    configured_oauth_provider = oauth_provider
+    if configured_oauth_provider is None and resolved_settings.supabase_url and resolved_settings.supabase_publishable_key:
+        configured_oauth_provider = SupabaseOAuthProvider(
+            resolved_settings.supabase_url,
+            resolved_settings.supabase_publishable_key,
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -103,6 +123,10 @@ def create_app(
             raise RuntimeError("Local fine-tuned model startup verification failed.") from exc
 
         app.state.model_service = service
+        app.state.oauth_flow_store = configured_flow_store
+        app.state.session_store = configured_session_store
+        app.state.oauth_provider = configured_oauth_provider
+        app.state.settings = resolved_settings
         if configured_supabase_service is not None:
             app.state.supabase_service = configured_supabase_service
         elif resolved_settings.supabase_url and resolved_settings.supabase_publishable_key:
@@ -126,6 +150,17 @@ def create_app(
             database.close()
 
     app = FastAPI(title="AI Resume ATS API", version="0.1.0", lifespan=lifespan)
+    app.include_router(create_auth_router(resolved_settings, configured_flow_store, configured_session_store, configured_oauth_provider))
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=sorted({f"{urlsplit(value).scheme}://{urlsplit(value).netloc}" for value in resolved_settings.auth_allowed_redirect_urls}),
+        allow_credentials=True,
+        allow_methods=["GET", "POST"],
+        allow_headers=["X-CSRF-Token", "Content-Type"],
+    )
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(item, RedactOAuthAccessLog) for item in access_logger.filters):
+        access_logger.addFilter(RedactOAuthAccessLog())
 
     @app.middleware("http")
     async def limit_expensive_analysis_requests(request: Request, call_next):

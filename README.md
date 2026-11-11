@@ -2,11 +2,12 @@
 
 ## Streamlit frontend (Phase 6)
 
-The Streamlit interface lives in `frontend/`. It uses Supabase's **publishable**
-key solely for signup/sign-in and keeps the resulting access token only in
-Streamlit's server-side session state. It never uses the Supabase secret key or
-Groq API key. When signed in, the token is passed to the existing backend as a
-Bearer token, allowing the existing RLS policies to scope saved history.
+The Streamlit interface lives in `frontend/`. Email/password sign-in keeps its
+access token in Streamlit session state. Google OAuth uses a FastAPI-owned,
+process-local server session and an opaque `HttpOnly` browser cookie; Google
+refresh tokens are never exposed to Streamlit or browser JavaScript. FastAPI
+continues to use the user's Supabase access token for database calls, allowing
+the existing RLS policies to scope saved history.
 
 ### Windows setup and launch
 
@@ -44,24 +45,43 @@ email confirmation or provider rate limits.
 
 ### Google OAuth
 
-Google OAuth is available alongside email/password authentication. Configure
-`FRONTEND_REDIRECT_URL=http://localhost:8501` (or your deployed Streamlit URL)
-to exactly match an allowed Supabase Auth redirect URL. Select **Continue with
-Google**, complete authentication on Google/Supabase, and the frontend exchanges
-only the returned one-time authorization code for a session. It verifies the
-returned user through Supabase before storing the access token and email in
-Streamlit session state. OAuth codes are removed from the URL after handling.
+Google OAuth is available alongside email/password authentication. FastAPI owns
+both PKCE start and callback processing. For the documented local ports, add
+this exact URL to **Supabase Dashboard → Authentication → URL Configuration →
+Redirect URLs**:
+
+```text
+http://localhost:8000/auth/google/callback
+```
+
+Keep `FRONTEND_REDIRECT_URL=http://localhost:8501`, set
+`AUTH_PUBLIC_URL=http://localhost:8000`, and allow the frontend through
+`AUTH_ALLOWED_REDIRECT_URLS=http://localhost:8501`. Do not mix `localhost` and
+`127.0.0.1` in browser-facing URLs because cookies are hostname-scoped.
 
 The Google client secret stays in Supabase/Google Cloud; it is not configured in
 this repository. Existing backend bearer verification and RLS continue to scope
 analysis history to the verified OAuth user.
 
-Google OAuth uses PKCE. The verifier is retained for at most 10 minutes in
-server memory under an opaque, single-use flow identifier included in the
-callback URL. The verifier itself is never sent in a URL, browser query
-parameter, or log. Complete the OAuth redirect against the same running
-Streamlit process; restarting the process intentionally invalidates pending
-login flows.
+Google OAuth uses PKCE plus application state and a short-lived transaction
+cookie. The verifier is retained for at most 10 minutes in FastAPI memory and
+is atomically consumed. Callback replay, invalid state, invalid transaction
+cookies, and unapproved return destinations are rejected. Callback query data
+is redacted from the application Uvicorn access logger; upstream proxy and host
+logs must also suppress or redact authentication query strings and cookies.
+
+Google sessions are process-local. Browser reload is supported, and expiring
+Supabase access tokens are refreshed under a per-session lock with refresh-token
+rotation. Restarting FastAPI invalidates active sessions and pending OAuth
+flows; users must sign in again. Run one FastAPI worker. Multiple workers or
+instances require shared PKCE/session storage and distributed refresh locking.
+
+Production requires a single HTTPS public origin, for example routing `/` to
+Streamlit and `/auth/*` plus API paths to FastAPI. Set `AUTH_COOKIE_SECURE=true`,
+use the same HTTPS origin in `AUTH_PUBLIC_URL` and
+`AUTH_ALLOWED_REDIRECT_URLS`, and add the exact HTTPS callback URL
+`https://your-host/auth/google/callback` to Supabase. Insecure or cross-origin
+production cookie configuration is rejected at startup.
 
 ### Using the frontend
 
@@ -95,8 +115,8 @@ scores are deterministic alignment indicators, not hiring probabilities.
   workers/instances, enforce a shared rate limit at the reverse proxy or API
   gateway; the built-in limiter is intentionally not distributed.
 - Frontend errors are mapped to safe user messages. Resume/JD input is never
-  rendered as unsafe HTML, and access tokens are held only in Streamlit session
-  state.
+  rendered as unsafe HTML. Google refresh tokens remain only in FastAPI's
+  process-local session store; the browser receives an opaque `HttpOnly` cookie.
 
 ## Backend setup
 

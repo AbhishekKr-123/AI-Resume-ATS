@@ -5,8 +5,10 @@ from __future__ import annotations
 import re
 import sys
 import logging
+import json
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlencode
 
 import streamlit as st
 
@@ -53,11 +55,75 @@ def backend_status(api_base_url: str, cache_bust: int = 0) -> dict[str, Any]:
 
 
 def _client(settings: FrontendSettings) -> ApiClient:
-    return ApiClient(settings.api_base_url)
+    return ApiClient(
+        settings.api_base_url,
+        session_id=_browser_session_id(settings),
+        session_cookie_name=settings.auth_cookie_name,
+    )
 
 
 def _token() -> str | None:
     return st.session_state.get("access_token")
+
+
+def _browser_session_id(settings: FrontendSettings) -> str | None:
+    return st.context.cookies.get(settings.auth_cookie_name)
+
+
+def _is_authenticated() -> bool:
+    return bool(_token() or st.session_state.get("browser_authenticated"))
+
+
+def _restore_browser_session(settings: FrontendSettings) -> None:
+    """Restore an opaque-cookie session before deciding whether to show sign-in."""
+    if _token() or not _browser_session_id(settings):
+        return
+    try:
+        status = _client(settings).session()
+    except ApiError:
+        clear_session(st.session_state)
+        return
+    st.session_state.browser_authenticated = True
+    st.session_state.auth_email = status.get("email", "Authenticated user")
+    st.session_state.auth_csrf_token = status.get("csrf_token")
+
+
+def _json_for_script(value: str) -> str:
+    """JSON-encode dynamic JavaScript values and neutralize HTML delimiters."""
+    return json.dumps(value).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+
+def _browser_logout_html(settings: FrontendSettings, csrf: str) -> str:
+    logout_url = _json_for_script(settings.auth_public_url + "/auth/logout")
+    csrf_value = _json_for_script(csrf)
+    redirect_url = _json_for_script(settings.oauth_redirect_url)
+    return f"""
+    <div style="font-family:sans-serif;color:#516074">Signing out…</div>
+    <script>
+    fetch({logout_url}, {{
+      method: 'POST', credentials: 'include',
+      headers: {{'X-CSRF-Token': {csrf_value}}}
+    }}).then(function(response) {{
+      if (!response.ok) throw new Error('logout failed');
+      return true;
+    }}).catch(function() {{
+      document.body.textContent = 'Sign-out could not be completed. Reload and try again.';
+      return false;
+    }}).then(function(success) {{
+      if (success) window.location.replace({redirect_url});
+    }});
+    </script>
+    """
+
+
+def _render_browser_logout(settings: FrontendSettings, key: str, use_container_width: bool = False) -> None:
+    if not st.button("Sign out", key=key, type="primary", use_container_width=use_container_width):
+        return
+    csrf = st.session_state.get("auth_csrf_token")
+    if not csrf:
+        clear_session(st.session_state)
+        st.rerun()
+    st.html(_browser_logout_html(settings, csrf), unsafe_allow_javascript=True)
 
 
 def _auth(settings: FrontendSettings) -> SupabaseAuth | None:
@@ -103,8 +169,16 @@ def _consume_google_callback(auth: SupabaseAuth | None) -> None:
 
 
 def _set_page(page: str) -> None:
-    st.session_state.current_page = page
+    selected = page if page in PAGES else "Dashboard"
+    st.session_state.current_page = selected
+    if st.query_params.get("page") != selected:
+        st.query_params["page"] = selected
     st.rerun()
+
+
+def _page_from_query() -> str:
+    page = st.query_params.get("page")
+    return page if page in PAGES else "Dashboard"
 
 
 def _friendly_api_error(error: ApiError) -> str:
@@ -205,13 +279,8 @@ def render_sign_in(settings: FrontendSettings) -> None:
         return
     if error := st.session_state.pop("oauth_error", None):
         st.error(error)
-    try:
-        google_url, _ = auth.google_authorization_url(settings.oauth_redirect_url)
-    except AuthError as exc:
-        google_url = None
-        st.error(str(exc))
-    if google_url:
-        st.link_button("Continue with Google", google_url, type="primary", use_container_width=True)
+    google_url = f"{settings.auth_public_url}/auth/google/start?{urlencode({'return_to': settings.oauth_redirect_url})}"
+    st.link_button("Continue with Google", google_url, type="primary", use_container_width=True)
     st.caption("Google sign-in is handled by Supabase. Your Google credentials are never sent to this application.")
     st.divider()
     login_tab, signup_tab = st.tabs(["Sign in", "Create account"])
@@ -257,7 +326,7 @@ def render_sign_in(settings: FrontendSettings) -> None:
 def render_dashboard(client: ApiClient) -> None:
     st.title("Good to see you")
     st.caption("Your resume alignment workspace")
-    if not _token():
+    if not _is_authenticated():
         st.info("Guest mode supports stateless analysis. Sign in to save your work and access history.")
         if st.button("Analyze a resume", type="primary"): _set_page("Analyze Resume")
         return
@@ -316,7 +385,7 @@ def render_analyze(settings: FrontendSettings, client: ApiClient) -> None:
 
 def render_history(client: ApiClient) -> None:
     st.title("Analysis history")
-    if not _token():
+    if not _is_authenticated():
         st.info("Sign in to access your saved analysis history."); return
     offset = st.session_state.get("history_offset", 0)
     try: rows = client.history(_token(), limit=10, offset=offset).get("analyses", [])
@@ -347,7 +416,7 @@ def render_history(client: ApiClient) -> None:
 
 def render_profile(settings: FrontendSettings) -> None:
     st.title("Profile")
-    if not _token(): st.info("You are using guest mode. Sign in to manage a profile and saved analyses."); return
+    if not _is_authenticated(): st.info("You are using guest mode. Sign in to manage a profile and saved analyses."); return
     st.subheader("Account")
     st.write(f"**Email:** {st.session_state.get('auth_email', 'Authenticated user')}")
     st.caption("Your access is scoped by Supabase Auth and database row-level security.")
@@ -355,7 +424,9 @@ def render_profile(settings: FrontendSettings) -> None:
     if st.button("Send password reset email") and auth:
         try: auth.reset_password(st.session_state.get("auth_email", "")); st.success("If the account is available, a reset email has been sent.")
         except AuthError as exc: st.error(str(exc))
-    if st.button("Sign out", type="primary"):
+    if st.session_state.get("browser_authenticated"):
+        _render_browser_logout(settings, "profile_browser_logout")
+    elif st.button("Sign out", type="primary"):
         if auth: auth.logout()
         clear_session(st.session_state); st.session_state.pop("guest_mode", None); st.rerun()
 
@@ -371,12 +442,17 @@ def _css() -> None:
 def main() -> None:
     st.set_page_config(page_title="AI Resume ATS", page_icon="📄", layout="wide")
     _css(); settings = load_frontend_settings()
-    _consume_google_callback(_auth(settings))
+    auth_result = st.query_params.get("auth")
+    if auth_result:
+        st.query_params.clear()
+        if auth_result == "success": st.session_state.oauth_success = "Signed in with Google."
+        else: st.session_state.oauth_error = "Google sign-in was cancelled or could not be completed. Please try again."
+    _restore_browser_session(settings)
     if success := st.session_state.pop("oauth_success", None):
         st.success(success)
-    if not _token() and not st.session_state.get("guest_mode"):
+    if not _is_authenticated() and not st.session_state.get("guest_mode"):
         render_sign_in(settings); return
-    client = _client(settings); current = st.session_state.get("current_page", "Dashboard")
+    client = _client(settings); current = _page_from_query(); st.session_state.current_page = current
     with st.sidebar:
         st.title("AI Resume ATS"); st.caption("Resume intelligence")
         status = backend_status(settings.api_base_url, st.session_state.get("status_bust", 0))
@@ -384,9 +460,11 @@ def main() -> None:
         if st.button("Check status", use_container_width=True):
             st.session_state.status_bust = st.session_state.get("status_bust", 0) + 1; st.rerun()
         page = st.radio("Navigation", PAGES, index=PAGES.index(current), label_visibility="collapsed")
-        if page != current: st.session_state.current_page = page
+        if page != current: _set_page(page)
         st.divider(); st.caption(st.session_state.get("auth_email", "Guest mode"))
-        if _token() and st.button("Sign out", use_container_width=True):
+        if st.session_state.get("browser_authenticated"):
+            _render_browser_logout(settings, "sidebar_browser_logout", use_container_width=True)
+        elif _token() and st.button("Sign out", use_container_width=True):
             auth = _auth(settings)
             if auth: auth.logout()
             clear_session(st.session_state); st.session_state.pop("guest_mode", None); st.rerun()

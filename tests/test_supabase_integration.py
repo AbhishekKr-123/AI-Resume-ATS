@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from backend.app.database_service import AuthenticatedUser, AuthenticationError, DatabaseError
 from backend.app.main import create_app
+from backend.app.session_service import SessionStore
 
 
 USER_A = UUID("11111111-1111-1111-1111-111111111111")
@@ -99,6 +100,28 @@ def test_history_get_delete_are_user_scoped(settings, loaded_model_service):
     assert len(own_history.json()["analyses"]) == 1
     assert other_get.status_code == other_delete.status_code == 404
     assert own_get.status_code == own_delete.status_code == 200
+
+
+def test_cookie_sessions_preserve_cross_user_rls_identity(settings, loaded_model_service):
+    from time import time
+
+    database = FakeSupabase()
+    row_a = database.insert_analysis(AuthenticatedUser(USER_A), "token-a", {"overall_ats_score": 80, "components": {}, "matched_skills": [], "missing_skills": [], "matched_keywords": [], "missing_keywords": []}, "a.docx")
+    sessions = SessionStore()
+    sid_a = sessions.create(USER_A, "a@example.test", "token-a", "refresh-a", time() + 3600)
+    sid_b = sessions.create(USER_B, "b@example.test", "token-b", "refresh-b", time() + 3600)
+
+    class Provider:
+        def refresh(self, _): raise AssertionError("valid access tokens must not refresh")
+
+    app = create_app(settings=settings, model_service=loaded_model_service, supabase_service=database, oauth_provider=Provider(), session_store=sessions)
+    with TestClient(app) as client:
+        client.cookies.set("ats_session_dev", sid_a)
+        own = client.get(f"/analyses/{row_a['id']}")
+        client.cookies.set("ats_session_dev", sid_b)
+        other = client.get(f"/analyses/{row_a['id']}")
+    assert own.status_code == 200
+    assert other.status_code == 404
 
 
 def test_feedback_persistence_failure_is_not_silent(settings, loaded_model_service):

@@ -156,5 +156,5 @@ class SupabaseAuth:
 
 
 def clear_session(session_state: Any) -> None:
-    for key in ("access_token", "auth_email", "latest_result", "latest_upload", "oauth_error", "oauth_success"):
+    for key in ("access_token", "auth_email", "auth_csrf_token", "browser_authenticated", "latest_result", "latest_upload", "oauth_error", "oauth_success"):
         session_state.pop(key, None)

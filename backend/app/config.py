@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -44,6 +45,12 @@ class Settings:
     supabase_timeout_seconds: float = 15.0
     analysis_rate_limit_requests: int = 30
     analysis_rate_limit_window_seconds: float = 60.0
+    auth_public_url: str = "http://localhost:8000"
+    auth_allowed_redirect_urls: tuple[str, ...] = ("http://localhost:8501",)
+    auth_cookie_secure: bool = False
+    auth_session_idle_seconds: float = 86_400.0
+    auth_session_absolute_seconds: float = 604_800.0
+    auth_refresh_skew_seconds: float = 60.0
 
     @property
     def model_path(self) -> Path:
@@ -119,6 +126,49 @@ def load_settings(project_root: Path | None = None) -> Settings:
     if analysis_rate_limit_requests <= 0 or analysis_rate_limit_window_seconds <= 0:
         raise ConfigurationError("Analysis rate-limit settings must be positive numbers.")
 
+    auth_public_url = os.getenv("AUTH_PUBLIC_URL", "http://localhost:8000").rstrip("/")
+    default_auth_redirect = os.getenv("FRONTEND_REDIRECT_URL", "http://localhost:8501")
+    redirects = tuple(
+        value.strip().rstrip("/")
+        for value in os.getenv("AUTH_ALLOWED_REDIRECT_URLS", default_auth_redirect).split(",")
+        if value.strip()
+    )
+    secure_text = os.getenv("AUTH_COOKIE_SECURE", "false").strip().casefold()
+    if secure_text not in {"true", "false"}:
+        raise ConfigurationError("AUTH_COOKIE_SECURE must be true or false.")
+    auth_cookie_secure = secure_text == "true"
+    try:
+        auth_session_idle_seconds = float(os.getenv("AUTH_SESSION_IDLE_SECONDS", "86400"))
+        auth_session_absolute_seconds = float(os.getenv("AUTH_SESSION_ABSOLUTE_SECONDS", "604800"))
+        auth_refresh_skew_seconds = float(os.getenv("AUTH_REFRESH_SKEW_SECONDS", "60"))
+    except ValueError as exc:
+        raise ConfigurationError("Authentication session lifetimes must be numeric.") from exc
+    if not redirects:
+        raise ConfigurationError("AUTH_ALLOWED_REDIRECT_URLS must contain at least one exact URL.")
+    if auth_session_idle_seconds <= 0 or auth_session_absolute_seconds <= 0 or auth_refresh_skew_seconds < 0:
+        raise ConfigurationError("Authentication session lifetimes are invalid.")
+    if auth_session_idle_seconds > auth_session_absolute_seconds:
+        raise ConfigurationError("AUTH_SESSION_IDLE_SECONDS cannot exceed AUTH_SESSION_ABSOLUTE_SECONDS.")
+
+    def validated_origin_url(value: str, name: str) -> tuple[str, str, int | None]:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            raise ConfigurationError(f"{name} must be an absolute HTTP(S) URL without credentials.")
+        if parsed.query or parsed.fragment:
+            raise ConfigurationError(f"{name} cannot contain a query string or fragment.")
+        if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise ConfigurationError(f"{name} must use HTTPS outside local development.")
+        return parsed.scheme, parsed.hostname, parsed.port
+
+    auth_origin = validated_origin_url(auth_public_url, "AUTH_PUBLIC_URL")
+    redirect_origins = [validated_origin_url(value, "AUTH_ALLOWED_REDIRECT_URLS") for value in redirects]
+    if auth_public_url.startswith("https://") and not auth_cookie_secure:
+        raise ConfigurationError("AUTH_COOKIE_SECURE must be true for HTTPS deployments.")
+    if auth_cookie_secure and auth_public_url.startswith("http://"):
+        raise ConfigurationError("Secure authentication cookies require an HTTPS AUTH_PUBLIC_URL.")
+    if auth_cookie_secure and any(origin != auth_origin for origin in redirect_origins):
+        raise ConfigurationError("Production authentication and frontend redirect URLs must use the same origin.")
+
     settings = Settings(
         project_root=root,
         max_upload_bytes=values["MAX_UPLOAD_BYTES"],
@@ -142,6 +192,12 @@ def load_settings(project_root: Path | None = None) -> Settings:
         supabase_timeout_seconds=supabase_timeout_seconds,
         analysis_rate_limit_requests=analysis_rate_limit_requests,
         analysis_rate_limit_window_seconds=analysis_rate_limit_window_seconds,
+        auth_public_url=auth_public_url,
+        auth_allowed_redirect_urls=redirects,
+        auth_cookie_secure=auth_cookie_secure,
+        auth_session_idle_seconds=auth_session_idle_seconds,
+        auth_session_absolute_seconds=auth_session_absolute_seconds,
+        auth_refresh_skew_seconds=auth_refresh_skew_seconds,
     )
 
     if not settings.model_path.is_dir():
