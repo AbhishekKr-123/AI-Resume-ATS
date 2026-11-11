@@ -177,6 +177,26 @@ def _run_auth(action: Callable[[], None]) -> bool:
         return False
 
 
+def _show_reset_form() -> None:
+    st.session_state.reset_form_visible = True
+
+
+def _render_password_reset(auth: SupabaseAuth) -> None:
+    st.button(
+        "Forgot password?",
+        key="forgot_password_button",
+        use_container_width=True,
+        on_click=_show_reset_form,
+    )
+    if st.session_state.get("reset_form_visible", False):
+        reset_email = st.text_input("Email for password reset", key="reset_email")
+        if st.button("Send reset email", key="reset_password"):
+            if not _valid_email(reset_email):
+                st.error("Enter a valid email address.")
+            elif _run_auth(lambda: auth.reset_password(reset_email.strip())):
+                st.success("If an account exists for this email, a password reset message has been sent.")
+
+
 def render_sign_in(settings: FrontendSettings) -> None:
     st.markdown("<div class='auth-brand'><span>RESUME INTELLIGENCE</span><h1>AI Resume ATS</h1><p>Understand how your resume aligns with the role before you apply.</p></div>", unsafe_allow_html=True)
     auth = _auth(settings)
@@ -211,15 +231,7 @@ def render_sign_in(settings: FrontendSettings) -> None:
                     st.session_state.auth_busy = False
                     st.rerun()
                 _run_auth(login); st.session_state.auth_busy = False
-        if st.button("Forgot password?", key="show_reset", use_container_width=True):
-            st.session_state.show_reset = True
-        if st.session_state.get("show_reset"):
-            reset_email = st.text_input("Email for password reset", key="reset_email")
-            if st.button("Send reset email", key="reset_password"):
-                if not _valid_email(reset_email): st.error("Enter a valid email address.")
-                else:
-                    if _run_auth(lambda: auth.reset_password(reset_email.strip())):
-                        st.success("If an account exists for this email, a password reset message has been sent.")
+        _render_password_reset(auth)
     with signup_tab:
         st.caption("Use at least 8 characters with a mix of letters, numbers, and symbols where your Supabase policy requires it.")
         with st.form("signup_form", clear_on_submit=False):

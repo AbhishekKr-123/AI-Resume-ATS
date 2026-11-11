@@ -3,12 +3,25 @@ from __future__ import annotations
 import base64
 import httpx
 import pytest
+from streamlit.testing.v1 import AppTest
 
 from frontend.api_client import ApiClient, ApiError, DOCX_MIME, PDF_MIME
-from frontend.app import _history_analysis, _validate_upload, check_backend
+from frontend.app import _history_analysis, _render_password_reset, _validate_upload, check_backend
 from frontend.auth import AuthError, SupabaseAuth, _safe_auth_message, _safe_diagnostic_message, clear_session, normalize_email
 from frontend.config import is_publishable_key, load_frontend_settings
 from frontend.oauth_storage import OAuthFlowStorage, consume_verifier
+
+
+def reset_form_app() -> None:
+    import streamlit as st
+    from frontend.app import _render_password_reset
+
+    class ResetAuthStub:
+        def reset_password(self, email: str) -> None:
+            calls = st.session_state.get("reset_calls", [])
+            st.session_state.reset_calls = [*calls, email]
+
+    _render_password_reset(ResetAuthStub())
 
 
 def response_handler(request: httpx.Request) -> httpx.Response:
@@ -161,6 +174,37 @@ def test_clear_session_removes_token_and_transient_resume_state():
     session = {"access_token": "secret", "auth_email": "a@example.test", "latest_result": {}, "latest_upload": b"x", "other": True}
     clear_session(session)
     assert session == {"other": True}
+
+
+def test_forgot_password_click_displays_persistent_form_without_widget_error():
+    app = AppTest.from_function(reset_form_app).run()
+    assert len(app.text_input) == 0
+    app.button[0].click().run()
+    assert len(app.exception) == 0
+    assert app.text_input[0].label == "Email for password reset"
+    app.run()
+    assert len(app.text_input) == 1
+    assert app.session_state["reset_form_visible"] is True
+
+
+def test_reset_email_submission_calls_existing_reset_method():
+    app = AppTest.from_function(reset_form_app).run()
+    app.button[0].click().run()
+    app.text_input[0].input(" person@example.test ").run()
+    app.button[1].click().run()
+    assert len(app.exception) == 0
+    assert app.session_state["reset_calls"] == ["person@example.test"]
+    assert app.success[0].value.startswith("If an account exists")
+
+
+def test_invalid_reset_email_does_not_call_reset_method():
+    app = AppTest.from_function(reset_form_app).run()
+    app.button[0].click().run()
+    app.text_input[0].input("invalid email").run()
+    app.button[1].click().run()
+    assert len(app.exception) == 0
+    assert "reset_calls" not in app.session_state
+    assert app.error[0].value == "Enter a valid email address."
 
 
 def test_auth_wraps_provider_errors_without_leaking_details(monkeypatch):
