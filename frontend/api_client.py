@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 import httpx
@@ -29,10 +30,14 @@ class ApiClient:
         raise ApiError("Only PDF and DOCX files are supported.")
 
     @staticmethod
+    def _encode_header(value: str) -> str:
+        return base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii")
+
+    @staticmethod
     def _headers(filename: str | None = None, job_description: str | None = None, token: str | None = None) -> dict[str, str]:
         headers: dict[str, str] = {}
-        if filename: headers["X-Upload-Filename"] = filename
-        if job_description is not None: headers["X-Job-Description"] = job_description
+        if filename: headers["X-Upload-Filename-Base64"] = ApiClient._encode_header(filename)
+        if job_description is not None: headers["X-Job-Description-Base64"] = ApiClient._encode_header(job_description)
         if token: headers["Authorization"] = f"Bearer {token}"
         return headers
 

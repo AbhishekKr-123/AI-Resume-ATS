@@ -30,6 +30,39 @@ Set `API_BASE_URL=http://127.0.0.1:8000`, `SUPABASE_URL`, and
 `SUPABASE_PUBLISHABLE_KEY` in your local `.env`. Do not place the Supabase
 secret key or Groq key in frontend configuration or browser-visible code.
 
+For Supabase's current key format, `SUPABASE_PUBLISHABLE_KEY` must be the key
+beginning `sb_publishable_`; never copy an `sb_secret_` key into that variable.
+The frontend rejects that mistake before it can call Supabase Auth. If signup
+returns `email_address_invalid`, use a standard email address with no internal
+spaces; the UI trims accidental leading/trailing whitespace and validates it
+before sending. If Supabase returns `over_email_send_rate_limit`, do not retry:
+wait for the provider's email-send window to reset. For production email,
+configure a custom SMTP provider in **Supabase Dashboard → Authentication →
+SMTP Settings** and review **Authentication → Providers → Email** (including
+confirmation-email policy and redirect URLs). This application does not bypass
+email confirmation or provider rate limits.
+
+### Google OAuth
+
+Google OAuth is available alongside email/password authentication. Configure
+`FRONTEND_REDIRECT_URL=http://localhost:8501` (or your deployed Streamlit URL)
+to exactly match an allowed Supabase Auth redirect URL. Select **Continue with
+Google**, complete authentication on Google/Supabase, and the frontend exchanges
+only the returned one-time authorization code for a session. It verifies the
+returned user through Supabase before storing the access token and email in
+Streamlit session state. OAuth codes are removed from the URL after handling.
+
+The Google client secret stays in Supabase/Google Cloud; it is not configured in
+this repository. Existing backend bearer verification and RLS continue to scope
+analysis history to the verified OAuth user.
+
+Google OAuth uses PKCE. The verifier is retained for at most 10 minutes in
+server memory under an opaque, single-use flow identifier included in the
+callback URL. The verifier itself is never sent in a URL, browser query
+parameter, or log. Complete the OAuth redirect against the same running
+Streamlit process; restarting the process intentionally invalidates pending
+login flows.
+
 ### Using the frontend
 
 1. Create an account or sign in. You may continue as a guest for stateless ATS
@@ -41,10 +74,11 @@ secret key or Groq key in frontend configuration or browser-visible code.
 4. Signed-in users can review and delete only their own persisted analyses in
    **Analysis history**. Guest analyses are not saved.
 
-The frontend sends the original document bytes as a raw request body, with
-`Content-Type`, `X-Upload-Filename`, and `X-Job-Description` headers required
-by the backend. It does not use multipart upload. ATS scores are deterministic
-alignment indicators, not hiring probabilities.
+The frontend sends the original document bytes as a raw request body. Filename
+and job-description metadata are UTF-8 encoded and transported as URL-safe
+Base64 in the ASCII-only `X-Upload-Filename-Base64` and
+`X-Job-Description-Base64` headers. It does not use multipart upload. ATS
+scores are deterministic alignment indicators, not hiring probabilities.
 
 ### Security controls and limits
 
@@ -92,7 +126,7 @@ environment before starting Uvicorn.
 
 `POST /resumes/extract` accepts a **raw PDF or DOCX request body**. It does not
 accept multipart form data. Send the content type as `Content-Type` and supply
-the original filename only through `X-Upload-Filename`; the server sanitizes it
+the UTF-8 filename as URL-safe Base64 through `X-Upload-Filename-Base64`; the server sanitizes it
 and uses it solely for file-type validation and response metadata.
 
 - Supported formats: PDF (`application/pdf`) and DOCX
@@ -144,11 +178,12 @@ curl.exe -X POST http://127.0.0.1:8000/job-descriptions/preprocess `
 
 ### Deterministic ATS analysis
 
-`POST /resumes/analyze` uses the same raw document body and required
-`X-Upload-Filename` header as extraction. Supply the job description in the
-`X-Job-Description` header. This endpoint is local-only and does not use Groq,
+`POST /resumes/analyze` uses the same raw document body and encoded filename
+header as extraction. Supply the UTF-8 job description as URL-safe Base64 in
+`X-Job-Description-Base64`. This endpoint is local-only and does not use Groq,
 external embedding services, or persistent storage.
-`X-Job-Description` is capped by `MAX_JOB_DESCRIPTION_CHARS` (default 20,000).
+The decoded job description is capped by `MAX_JOB_DESCRIPTION_CHARS` (default
+20,000). Legacy unencoded headers remain accepted for ASCII-only API clients.
 
 ```powershell
 curl.exe -X POST http://127.0.0.1:8000/resumes/analyze `

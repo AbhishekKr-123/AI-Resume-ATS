@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -56,6 +58,27 @@ class ResumeAnalysisResponse(BaseModel):
 
 class ResumeFeedbackResponse(ResumeAnalysisResponse):
     feedback: dict
+
+
+def _decode_utf8_header(value: str, label: str) -> str:
+    """Strictly decode an ASCII URL-safe Base64 header as UTF-8."""
+    try:
+        decoded = base64.b64decode(value.encode("ascii"), altchars=b"-_", validate=True)
+        return decoded.decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError, binascii.Error, ValueError) as exc:
+        raise IngestionError(
+            "invalid_header_encoding",
+            f"The {label} header is not valid URL-safe Base64 UTF-8.",
+            400,
+        ) from exc
+
+
+def _text_header(request: Request, encoded_name: str, legacy_name: str, label: str) -> str | None:
+    """Prefer Unicode-safe transport while retaining ASCII legacy compatibility."""
+    encoded = request.headers.get(encoded_name)
+    if encoded is not None:
+        return _decode_utf8_header(encoded, label)
+    return request.headers.get(legacy_name)
 
 
 def create_app(
@@ -154,7 +177,7 @@ def create_app(
     openapi_extra={
         "parameters": [
             {
-                "name": "X-Upload-Filename",
+                "name": "X-Upload-Filename-Base64",
                 "in": "header",
                 "required": True,
                 "schema": {"type": "string"},
@@ -182,10 +205,10 @@ def create_app(
 )
     async def extract_resume(request: Request) -> ResumeExtractionResponse:
         """Stream, validate, and extract a raw document without multipart file spooling."""
-        filename = request.headers.get("x-upload-filename")
+        filename = _text_header(request, "x-upload-filename-base64", "x-upload-filename", "upload filename")
         if not filename:
             raise IngestionError(
-                "missing_filename", "An X-Upload-Filename header is required.", 400
+                "missing_filename", "An X-Upload-Filename-Base64 header is required.", 400
             )
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         validate_declared_content_length(
@@ -221,12 +244,12 @@ def create_app(
     async def analyze_resume(request: Request) -> ResumeAnalysisResponse:
         """Analyze one securely streamed resume using only the lifespan-loaded model."""
         authenticated = await optional_authenticated_user(request)
-        filename = request.headers.get("x-upload-filename")
+        filename = _text_header(request, "x-upload-filename-base64", "x-upload-filename", "upload filename")
         if not filename:
-            raise IngestionError("missing_filename", "An X-Upload-Filename header is required.", 400)
-        raw_job_description = request.headers.get("x-job-description")
+            raise IngestionError("missing_filename", "An X-Upload-Filename-Base64 header is required.", 400)
+        raw_job_description = _text_header(request, "x-job-description-base64", "x-job-description", "job description")
         if raw_job_description is None:
-            raise IngestionError("missing_job_description", "An X-Job-Description header is required.", 400)
+            raise IngestionError("missing_job_description", "An X-Job-Description-Base64 header is required.", 400)
         if len(raw_job_description) > resolved_settings.max_job_description_chars:
             raise IngestionError("job_description_too_large", "The job description exceeds the configured size limit.", 413)
         try:
@@ -268,12 +291,12 @@ def create_app(
         feedback_client: GroqFeedbackService | None = getattr(request.app.state, "feedback_service", None)
         if feedback_client is None:
             raise FeedbackError("groq_not_configured", "Groq feedback is not configured.", 503)
-        filename = request.headers.get("x-upload-filename")
-        raw_job_description = request.headers.get("x-job-description")
+        filename = _text_header(request, "x-upload-filename-base64", "x-upload-filename", "upload filename")
+        raw_job_description = _text_header(request, "x-job-description-base64", "x-job-description", "job description")
         if not filename:
-            raise IngestionError("missing_filename", "An X-Upload-Filename header is required.", 400)
+            raise IngestionError("missing_filename", "An X-Upload-Filename-Base64 header is required.", 400)
         if raw_job_description is None:
-            raise IngestionError("missing_job_description", "An X-Job-Description header is required.", 400)
+            raise IngestionError("missing_job_description", "An X-Job-Description-Base64 header is required.", 400)
         if len(raw_job_description) > resolved_settings.max_job_description_chars:
             raise IngestionError("job_description_too_large", "The job description exceeds the configured size limit.", 413)
         try:

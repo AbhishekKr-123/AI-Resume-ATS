@@ -1,6 +1,7 @@
 from dataclasses import replace
 from io import BytesIO
 from types import SimpleNamespace
+import base64
 
 import httpx
 import json
@@ -199,3 +200,17 @@ def test_feedback_endpoint_success_failure_and_analysis_independence(settings, l
     assert unavailable.status_code == 503
     assert unavailable.json()["error"]["code"] == "groq_not_configured"
     assert still_analyzes.status_code == 200
+
+
+def test_feedback_endpoint_decodes_unicode_base64_headers(settings, loaded_model_service):
+    encode = lambda value: base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii")
+    app = create_app(settings=settings, model_service=loaded_model_service, feedback_service=feedback_service(valid_feedback()))
+    headers = {
+        "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "x-upload-filename-base64": encode("résumé—final.docx"),
+        "x-job-description-base64": encode("Python SQL AWS required — Docker preferred. Expérience appréciée."),
+    }
+    with TestClient(app) as client:
+        response = client.post("/resumes/feedback", content=make_docx(resume_text()), headers=headers)
+    assert response.status_code == 200
+    assert response.json()["filename"] == "r_sum_final.docx"

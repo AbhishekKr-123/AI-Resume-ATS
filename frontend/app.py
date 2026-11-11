@@ -3,15 +3,27 @@
 from __future__ import annotations
 
 import re
+import sys
+import logging
+from pathlib import Path
 from typing import Any, Callable
 
 import streamlit as st
+
+# `streamlit run frontend/app.py` executes this file as a script and can place
+# frontend/ (rather than the project root) first on sys.path. Ensure the one
+# canonical `frontend` package is importable in both script and module modes.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from frontend.api_client import ApiClient, ApiError
 from frontend.auth import AuthError, SupabaseAuth, clear_session
 from frontend.components.feedback_display import render_feedback
 from frontend.components.score_display import render_analysis
 from frontend.config import FrontendSettings, load_frontend_settings
+
+logger = logging.getLogger(__name__)
 
 PAGES = ("Dashboard", "Analyze Resume", "Analysis History", "Profile")
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -54,6 +66,42 @@ def _auth(settings: FrontendSettings) -> SupabaseAuth | None:
     return SupabaseAuth(settings.supabase_url, settings.supabase_publishable_key)
 
 
+def _consume_google_callback(auth: SupabaseAuth | None) -> None:
+    """Exchange an OAuth code once, then remove it from the browser URL."""
+    code = st.query_params.get("code")
+    flow_id = st.query_params.get("oauth_flow")
+    provider_error = st.query_params.get("error")
+    if code or provider_error:
+        logger.info("Google OAuth callback received query parameter names: %s", sorted(st.query_params.keys()))
+    if provider_error:
+        st.query_params.clear()
+        st.session_state.oauth_error = "Google sign-in was cancelled or could not be completed. Please try again."
+        return
+    if not code:
+        return
+    if not flow_id:
+        st.query_params.clear()
+        st.session_state.oauth_error = "Google sign-in session information is missing. Start Google sign-in again."
+        return
+    if auth is None:
+        st.query_params.clear()
+        st.session_state.oauth_error = "Google sign-in is unavailable because authentication is not configured."
+        return
+    try:
+        logger.info("Google OAuth callback received an authorization code; beginning Supabase exchange.")
+        with st.spinner("Completing Google sign-in..."):
+            token, email = auth.complete_google_callback(str(code), str(flow_id))
+        st.session_state.access_token = token
+        st.session_state.auth_email = email
+        st.session_state.pop("guest_mode", None)
+        st.session_state.oauth_success = "Signed in with Google."
+    except AuthError as exc:
+        st.session_state.oauth_error = str(exc)
+    finally:
+        # Never retain one-time authorization codes in browser-visible URLs.
+        st.query_params.clear()
+
+
 def _set_page(page: str) -> None:
     st.session_state.current_page = page
     st.rerun()
@@ -73,13 +121,37 @@ def _friendly_api_error(error: ApiError) -> str:
 
 
 def _history_analysis(record: dict[str, Any]) -> dict[str, Any]:
+    components = record.get("component_scores", {})
+    if not isinstance(components, dict):
+        components = {}
+
+    semantic = components.get("semantic_similarity", {})
+    semantic_evidence = semantic.get("evidence", {}) if isinstance(semantic, dict) else {}
+    matches = semantic_evidence.get("matches", []) if isinstance(semantic_evidence, dict) else []
+    relevant_evidence = matches if isinstance(matches, list) else []
+
+    improvement_areas: list[dict[str, Any]] = []
+    for name, item in components.items():
+        if not isinstance(item, dict):
+            continue
+        score = item.get("score")
+        if not isinstance(score, (int, float)) or score >= 70:
+            continue
+        missing = item.get("missing_requirements", [])
+        improvement_areas.append({
+            "component": name,
+            "missing_requirements": missing if isinstance(missing, list) else [],
+        })
+
     return {
-        "overall_ats_score": record["overall_score"], "maximum_score": 100.0,
+        "overall_ats_score": record.get("overall_score", 0), "maximum_score": 100.0,
         "methodology_version": "deterministic-ats-v1",
         "disclaimer": "This deterministic ATS indicator is not a hiring probability or a guarantee of selection.",
-        "components": record.get("component_scores", {}), "matched_skills": record.get("matched_skills", []),
+        "components": components, "matched_skills": record.get("matched_skills", []),
         "missing_skills": record.get("missing_skills", []), "matched_keywords": record.get("matched_keywords", []),
-        "missing_keywords": record.get("missing_keywords", []), "relevant_resume_evidence": [], "areas_needing_improvement": [],
+        "missing_keywords": record.get("missing_keywords", []),
+        "relevant_resume_evidence": relevant_evidence,
+        "areas_needing_improvement": improvement_areas,
     }
 
 
@@ -109,8 +181,19 @@ def render_sign_in(settings: FrontendSettings) -> None:
     st.markdown("<div class='auth-brand'><span>RESUME INTELLIGENCE</span><h1>AI Resume ATS</h1><p>Understand how your resume aligns with the role before you apply.</p></div>", unsafe_allow_html=True)
     auth = _auth(settings)
     if auth is None:
-        st.error("Authentication is not configured. Add the Supabase URL and publishable key to the local environment.")
+        st.error(settings.auth_configuration_error or "Authentication is not configured. Add the Supabase URL and publishable key to the local environment.")
         return
+    if error := st.session_state.pop("oauth_error", None):
+        st.error(error)
+    try:
+        google_url, _ = auth.google_authorization_url(settings.oauth_redirect_url)
+    except AuthError as exc:
+        google_url = None
+        st.error(str(exc))
+    if google_url:
+        st.link_button("Continue with Google", google_url, type="primary", use_container_width=True)
+    st.caption("Google sign-in is handled by Supabase. Your Google credentials are never sent to this application.")
+    st.divider()
     login_tab, signup_tab = st.tabs(["Sign in", "Create account"])
     with login_tab:
         with st.form("login_form", clear_on_submit=False):
@@ -276,6 +359,9 @@ def _css() -> None:
 def main() -> None:
     st.set_page_config(page_title="AI Resume ATS", page_icon="📄", layout="wide")
     _css(); settings = load_frontend_settings()
+    _consume_google_callback(_auth(settings))
+    if success := st.session_state.pop("oauth_success", None):
+        st.success(success)
     if not _token() and not st.session_state.get("guest_mode"):
         render_sign_in(settings); return
     client = _client(settings); current = st.session_state.get("current_page", "Dashboard")

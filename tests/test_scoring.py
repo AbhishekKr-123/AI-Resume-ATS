@@ -1,5 +1,6 @@
 from dataclasses import replace
 from io import BytesIO
+import base64
 
 import pytest
 from docx import Document
@@ -124,6 +125,40 @@ def test_analyze_api_and_empty_job_description(settings, loaded_model_service):
         )
     assert too_large.status_code == 413
     assert too_large.json()["error"]["code"] == "job_description_too_large"
+
+
+@pytest.mark.parametrize("job_description", [
+    "Python data engineer — SQL required.",
+    "Développeur Python expérimenté; sécurité requise.",
+    "Python とデータ分析の経験が必要です。",
+])
+def test_analyze_api_decodes_unicode_base64_headers(settings, loaded_model_service, job_description):
+    encode = lambda value: base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii")
+    app = create_app(settings=settings, model_service=loaded_model_service)
+    with TestClient(app) as client:
+        response = client.post(
+            "/resumes/analyze",
+            content=make_docx(resume_text()),
+            headers={
+                "content-type": DOCX_MIME,
+                "x-upload-filename-base64": encode("résumé—final.docx"),
+                "x-job-description-base64": encode(job_description),
+            },
+        )
+    assert response.status_code == 200
+    assert response.json()["filename"] == "r_sum_final.docx"
+
+
+def test_analyze_api_rejects_invalid_base64_header(settings, loaded_model_service):
+    app = create_app(settings=settings, model_service=loaded_model_service)
+    with TestClient(app) as client:
+        response = client.post(
+            "/resumes/analyze",
+            content=make_docx(resume_text()),
+            headers={"content-type": DOCX_MIME, "x-upload-filename": "resume.docx", "x-job-description-base64": "not valid ***"},
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_header_encoding"
 
 
 def test_model_unavailable_returns_structured_error(settings, loaded_model_service):
