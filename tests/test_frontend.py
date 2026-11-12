@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime
 import httpx
 import pytest
 from streamlit.testing.v1 import AppTest
 
 from frontend.api_client import ApiClient, ApiError, DOCX_MIME, PDF_MIME
-from frontend.app import PAGES, _browser_logout_html, _history_analysis, _render_password_reset, _validate_upload, check_backend
+from frontend.app import PAGES, _browser_logout_html, _dashboard_history, _dashboard_metrics, _history_analysis, _latest_breakdown, _oauth_link_html, _render_password_reset, _score_chart_data, _upload_limit_mib, _validate_upload, check_backend
 from frontend.auth import AuthError, SupabaseAuth, _safe_auth_message, _safe_diagnostic_message, clear_session, normalize_email
 from frontend.config import FrontendSettings, is_publishable_key, load_frontend_settings
 from frontend.oauth_storage import OAuthFlowStorage, consume_verifier
@@ -33,6 +34,96 @@ def navigation_query_app() -> None:
     if page != current:
         _set_page(page)
     st.write(f"Selected: {page}")
+
+
+def dashboard_test_app(populated: bool = True) -> None:
+    import streamlit as st
+    from frontend.app import render_dashboard
+
+    class Client:
+        def history(self, _token, limit=100, offset=0):
+            assert limit == 100
+            assert offset == 0
+            if not populated:
+                return {"analyses": []}
+            return {"analyses": [
+                {"id": "new", "overall_score": 82.0, "filename": "latest.pdf", "created_at": "2026-11-10T10:00:00Z", "component_scores": {"semantic_similarity": {"score": 84}, "technical_skills": {"score": 80}, "keywords": {"score": 76}, "experience_relevance": {"score": 88}, "formatting_completeness": {"score": 90}}},
+                {"id": "old", "overall_score": 68.0, "filename": "older.pdf", "created_at": "2026-11-01T10:00:00Z", "component_scores": {}},
+            ]}
+
+        def get_analysis(self, analysis_id, _token):
+            return {"id": analysis_id}
+
+    st.session_state.browser_authenticated = True
+    st.session_state.auth_email = "person@example.test"
+    render_dashboard(Client())
+
+
+def analyze_upload_test_app() -> None:
+    from frontend.app import render_analyze
+    from frontend.config import FrontendSettings
+
+    settings = FrontendSettings("https://api.test", None, None, 5 * 1024 * 1024)
+    render_analyze(settings, object())
+
+
+def analyze_workflow_test_app(mode: str = "success", busy: bool = False) -> None:
+    import streamlit as st
+    from frontend.api_client import ApiError
+    from frontend.app import render_analyze
+    from frontend.config import FrontendSettings
+
+    analysis = {
+        "overall_ats_score": 78.5,
+        "disclaimer": "This deterministic ATS indicator is not a hiring probability or a guarantee of selection.",
+        "components": {
+            "semantic_similarity": {"score": 80, "weight": 35, "explanation": "Semantic explanation"},
+            "technical_skills": {"score": 75, "weight": 25, "explanation": "Skills explanation"},
+            "keywords": {"score": 70, "weight": 15, "explanation": "Keywords explanation"},
+            "experience_relevance": {"score": 85, "weight": 15, "explanation": "Experience explanation"},
+            "formatting_completeness": {"score": 90, "weight": 10, "explanation": "Formatting explanation"},
+        },
+        "matched_skills": ["Python"], "missing_skills": ["Kubernetes"],
+        "matched_keywords": ["APIs"], "missing_keywords": ["observability"],
+        "relevant_resume_evidence": [{"resume_section": "projects", "similarity": 0.82}],
+        "areas_needing_improvement": [{"component": "keywords", "missing_requirements": ["observability"]}],
+    }
+    feedback = {
+        "overall_feedback": "Strong foundation with focused improvements available.",
+        "strengths": [{"title": "Relevant projects", "explanation": "Projects align with the role.", "supporting_evidence": ["API project"]}],
+        "missing_skills_feedback": [], "resume_improvements": [], "project_recommendations": [],
+        "action_plan": {"high_priority": ["Add observability evidence"], "medium_priority": [], "long_term": []},
+    }
+
+    class Client:
+        def _respond(self, method, content, filename, description, token):
+            st.session_state.api_call = {"method": method, "content": content, "filename": filename, "description": description, "token": token}
+            if mode == "error":
+                raise ApiError("Analysis failed safely", status_code=422)
+            result = {"analysis": analysis}
+            if method == "feedback":
+                result["feedback"] = feedback
+            return result
+
+        def analyze(self, content, filename, description, token):
+            return self._respond("analyze", content, filename, description, token)
+
+        def feedback(self, content, filename, description, token):
+            return self._respond("feedback", content, filename, description, token)
+
+    if busy:
+        st.session_state.analysis_busy = True
+    render_analyze(FrontendSettings("https://api.test", None, None, 5 * 1024 * 1024), Client())
+
+
+def incomplete_analysis_result_test_app() -> None:
+    from frontend.app import _render_analyze_result
+    _render_analyze_result({"analysis": {"overall_ats_score": 42, "components": {}}})
+
+
+def shared_css_test_app() -> None:
+    from frontend.app import _css
+    _css()
 
 
 def response_handler(request: httpx.Request) -> httpx.Response:
@@ -66,6 +157,13 @@ def test_api_client_forwards_only_opaque_session_cookie_when_no_bearer_token():
         session_id="opaque-session-id",
     )
     assert client.session()["authenticated"] is True
+
+
+def test_google_oauth_link_uses_same_tab_without_changing_start_endpoint():
+    markup = _oauth_link_html("http://localhost:8000/auth/google/start?return_to=http%3A%2F%2Flocalhost%3A8501")
+    assert 'target="_self"' in markup
+    assert 'target="_blank"' not in markup
+    assert "/auth/google/start?return_to=" in markup
 
 
 def test_browser_logout_script_preserves_secure_post_and_top_level_navigation():
@@ -227,6 +325,179 @@ def test_history_mapping_uses_only_persisted_response_fields():
     assert analysis["components"]["keywords"]["weight"] == 15
     assert analysis["relevant_resume_evidence"] == evidence
     assert analysis["areas_needing_improvement"] == [{"component": "keywords", "missing_requirements": ["kubernetes"]}]
+
+
+def test_dashboard_helpers_use_only_persisted_history_values():
+    rows = [
+        {"overall_score": 82.0, "filename": "latest.pdf", "created_at": "2026-11-10T10:00:00Z", "component_scores": {"semantic_similarity": {"score": 84}, "technical_skills": {"score": 80}, "keywords": {"score": 76}, "experience_relevance": {"score": 88}, "formatting_completeness": {"score": 90}}},
+        {"overall_score": 68.0, "filename": "older.pdf", "created_at": "2026-11-01T10:00:00Z", "component_scores": {}},
+    ]
+    assert _dashboard_metrics(rows) == {"count": 2, "average": 75.0, "latest": 82.0, "best": 82.0}
+    chart = _score_chart_data(rows)
+    assert [point["overall_score"] for point in chart] == [68.0, 82.0]
+    assert all(isinstance(point["created_at"], datetime) for point in chart)
+    assert [point["filename"] for point in chart] == ["older.pdf", "latest.pdf"]
+    assert _latest_breakdown(rows) == [("Semantic Similarity", 84.0), ("Technical Skills", 80.0), ("Keywords", 76.0), ("Experience Relevance", 88.0), ("Formatting", 90.0)]
+
+
+def test_dashboard_history_pages_existing_endpoint_for_complete_statistics():
+    class Client:
+        def __init__(self): self.offsets = []
+        def history(self, _token, limit, offset):
+            self.offsets.append(offset)
+            return {"analyses": [{"overall_score": 70}] * (100 if offset == 0 else 1)}
+
+    client = Client()
+    assert len(_dashboard_history(client)) == 101
+    assert client.offsets == [0, 100]
+
+
+def test_upload_control_and_visible_instructions_use_authoritative_five_mib_limit():
+    assert _upload_limit_mib(5 * 1024 * 1024) == 5
+    app = AppTest.from_function(analyze_upload_test_app).run()
+    assert len(app.exception) == 0
+    assert app.file_uploader[0].help == "PDF or DOCX, up to 5 MiB"
+    assert any(item.value == "PDF or DOCX · Maximum 5 MiB per file" for item in app.caption)
+
+
+def test_analysis_actions_stay_disabled_until_file_and_job_description_exist():
+    app = AppTest.from_function(analyze_workflow_test_app).run()
+    assert [(button.label, button.disabled) for button in app.button] == [
+        ("Analyze Resume", True), ("Generate AI feedback", True),
+    ]
+    app.file_uploader[0].upload("resume.pdf", b"%PDF-test", PDF_MIME).run()
+    assert next(button for button in app.button if button.label == "Analyze Resume").disabled is True
+    app.text_area[0].input("Python API role").run()
+    assert next(button for button in app.button if button.label == "Analyze Resume").disabled is False
+    assert any("resume.pdf" in item.value and "Ready to analyze" in item.value for item in app.markdown)
+
+
+@pytest.mark.parametrize(("filename", "mime_type"), [("resume.pdf", PDF_MIME), ("resume.docx", DOCX_MIME)])
+def test_pdf_and_docx_analysis_submission_preserves_existing_api_contract(filename, mime_type):
+    app = AppTest.from_function(analyze_workflow_test_app).run()
+    app.file_uploader[0].upload(filename, b"document-bytes", mime_type).run()
+    app.text_area[0].input("Python API role").run()
+    next(button for button in app.button if button.label == "Analyze Resume").click().run()
+    assert len(app.exception) == 0
+    assert app.session_state["api_call"] == {
+        "method": "analyze", "content": b"document-bytes", "filename": filename,
+        "description": "Python API role", "token": None,
+    }
+    rendered = " ".join(item.value for item in app.markdown)
+    assert "Your resume results" in rendered
+    assert "Component score breakdown" in rendered
+    assert "Python" in rendered and "Kubernetes" in rendered
+    assert "Projects" in rendered and "Keywords" in rendered
+    assert "AI feedback not generated" in rendered
+
+
+def test_generate_feedback_uses_feedback_endpoint_and_renders_only_returned_feedback():
+    app = AppTest.from_function(analyze_workflow_test_app).run()
+    app.file_uploader[0].upload("resume.pdf", b"pdf", PDF_MIME).run()
+    app.text_area[0].input("Python role").run()
+    next(button for button in app.button if button.label == "Generate AI feedback").click().run()
+    assert app.session_state["api_call"]["method"] == "feedback"
+    rendered = " ".join(item.value for item in app.markdown)
+    assert "Strong foundation with focused improvements available." in rendered
+    assert "Relevant projects" in rendered
+    assert "Add observability evidence" in rendered
+
+
+def test_analysis_error_and_loading_states_are_clear_and_do_not_duplicate_requests():
+    busy = AppTest.from_function(analyze_workflow_test_app, args=("success", True)).run()
+    assert all(button.disabled for button in busy.button)
+    assert busy.info[0].value == "Analysis is in progress. Please keep this page open."
+
+    failed = AppTest.from_function(analyze_workflow_test_app, args=("error",)).run()
+    failed.file_uploader[0].upload("resume.pdf", b"pdf", PDF_MIME).run()
+    failed.text_area[0].input("Python role").run()
+    next(button for button in failed.button if button.label == "Analyze Resume").click().run()
+    assert len(failed.exception) == 0
+    assert failed.error[0].value == "Analysis failed safely"
+    assert "latest_result" not in failed.session_state
+
+
+def test_analysis_result_handles_missing_optional_sections_without_fabrication():
+    app = AppTest.from_function(incomplete_analysis_result_test_app).run()
+    assert len(app.exception) == 0
+    rendered = " ".join(item.value for item in app.markdown)
+    assert "Component score details were not included" in app.info[0].value
+    assert "No matched skills were identified" in " ".join(item.value for item in app.caption)
+    assert "AI feedback not generated" in rendered
+
+
+def test_shared_css_preserves_streamlit_icon_fonts_and_labels_uploader_once():
+    app = AppTest.from_function(shared_css_test_app).run()
+    stylesheet = " ".join(item.value for item in app.markdown)
+    assert "[class*='st-']" not in stylesheet
+    assert "content:'Browse files'" in stylesheet
+    assert "stFileUploaderDropzone'] button>*{display:none" in stylesheet
+    assert "stSidebarContent']{padding-top:1.25rem;overflow-x:hidden" in stylesheet
+
+
+def test_heading_anchor_css_targets_only_streamlit_heading_links():
+    app = AppTest.from_function(shared_css_test_app).run()
+    stylesheet = " ".join(item.value for item in app.markdown)
+    assert "[data-testid='stHeaderActionElements'] a[aria-label='Link to heading']{display:none!important}" in stylesheet
+    assert ".oauth-button" in stylesheet
+    assert "a{display:none" not in stylesheet
+
+
+def test_browse_action_state_tracks_upload_and_remove_nonce_workflow():
+    app = AppTest.from_function(analyze_workflow_test_app).run()
+    assert app.file_uploader[0].value is None
+    assert not any("upload-selected-marker" in item.value for item in app.markdown)
+
+    app.file_uploader[0].upload("resume.pdf", b"pdf", PDF_MIME).run()
+    assert app.file_uploader[0].value.name == "resume.pdf"
+    assert any("upload-selected-marker" in item.value for item in app.markdown)
+    next(button for button in app.button if button.label == "Remove").click().run()
+
+    assert app.file_uploader[0].value is None
+    assert not any("upload-selected-marker" in item.value for item in app.markdown)
+    assert next(button for button in app.button if button.label == "Analyze Resume").disabled is True
+
+
+def test_analysis_spacing_centered_actions_and_typography_rules_are_present():
+    app = AppTest.from_function(shared_css_test_app).run()
+    stylesheet = " ".join(item.value for item in app.markdown)
+    assert "stVerticalBlockBorderWrapper']:has(.upload-selected-marker)" in stylesheet
+    assert ".selected-file{display:flex" in stylesheet and "margin-top:18px" in stylesheet
+    assert ":has(.analysis-action-marker){align-items:stretch;gap:1rem}" in stylesheet
+    assert ":has(.analysis-action-marker){flex-direction:column;align-items:center}" in stylesheet
+    assert ".stApp{background:var(--canvas);color:var(--navy);font-size:16px" in stylesheet
+    assert "h1{font-size:1.9rem" in stylesheet
+    assert ".stButton>button,.stLinkButton>a{border-radius:9px;font-size:.9rem" in stylesheet
+
+
+def test_dashboard_populated_and_empty_states_render_actual_metrics():
+    populated = AppTest.from_function(dashboard_test_app, args=(True,)).run()
+    assert len(populated.exception) == 0
+    assert [metric.value for metric in populated.metric] == ["2", "75.0", "82.0", "82.0"]
+    assert any("latest.pdf" in item.value for item in populated.markdown)
+    assert any("Score performance" in item.value for item in populated.markdown)
+    assert any("Score breakdown" in item.value for item in populated.markdown)
+
+    empty = AppTest.from_function(dashboard_test_app, args=(False,)).run()
+    assert len(empty.exception) == 0
+    assert [metric.value for metric in empty.metric] == ["0", "—", "—", "—"]
+    rendered = " ".join(item.value for item in empty.markdown)
+    assert "No score history yet" in rendered
+    assert "No analyses yet" in rendered
+
+
+@pytest.mark.parametrize(("label", "page"), [
+    ("＋ Analyze New Resume", "Analyze Resume"),
+    ("＋  Analyze a Resume", "Analyze Resume"),
+    ("↗  View History", "Analysis History"),
+    ("○  Update Profile", "Profile"),
+])
+def test_dashboard_actions_preserve_existing_page_navigation(label, page):
+    app = AppTest.from_function(dashboard_test_app, args=(False,)).run()
+    button = next(item for item in app.button if item.label == label)
+    button.click().run()
+    assert len(app.exception) == 0
+    assert app.query_params["page"] == page
 
 
 @pytest.mark.parametrize("record", [
