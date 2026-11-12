@@ -58,6 +58,18 @@ def test_sessions_are_isolated_and_revocation_is_identifier_specific():
     assert store.resolve(sid_b, no_refresh).user_id == user_b
 
 
+def test_session_persists_and_clears_safe_display_name():
+    clock = Clock()
+    store = SessionStore(clock=clock, refresh_skew_seconds=0)
+    sid = store.create(uuid4(), "user@example.test", "access", "refresh", 2_000, "Abhishek Kumar")
+    resolved = store.resolve(sid, lambda _: pytest.fail("valid tokens must not refresh"))
+    assert resolved.display_name == "Abhishek Kumar"
+    revoked = store.revoke(sid)
+    assert revoked is not None and revoked.display_name is None
+    with pytest.raises(InvalidSession):
+        store.resolve(sid, lambda _: pytest.fail("revoked sessions must not refresh"))
+
+
 def test_refresh_rotation_is_serialized_and_replaces_refresh_token():
     clock = Clock()
     store = SessionStore(clock=clock, refresh_skew_seconds=60)

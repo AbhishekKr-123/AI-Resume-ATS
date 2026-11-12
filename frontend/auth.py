@@ -27,6 +27,20 @@ class AuthError(RuntimeError):
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+def _verified_display_name(user: Any) -> str | None:
+    sources = (getattr(user, "user_metadata", None), getattr(user, "profile", None))
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for field in ("full_name", "name"):
+            value = source.get(field)
+            if isinstance(value, str):
+                normalized = " ".join(value.split())
+                if normalized and "@" not in normalized:
+                    return normalized
+    return None
+
+
 def normalize_email(email: str) -> str:
     """Strip accidental surrounding whitespace and reject invalid input locally."""
     normalized = email.strip()
@@ -71,12 +85,19 @@ class SupabaseAuth:
         self._url = url
         self._publishable_key = publishable_key
         self._client = create_client(url, publishable_key)
+        self._display_name: str | None = None
+
+    @property
+    def display_name(self) -> str | None:
+        return self._display_name
 
     def login(self, email: str, password: str) -> str:
         try:
             response = self._client.auth.sign_in_with_password({"email": normalize_email(email), "password": password})
             if response.session is None:
                 raise AuthError("Sign-in did not return a session. Confirm your email and try again.")
+            user = getattr(response, "user", None) or getattr(response.session, "user", None)
+            self._display_name = _verified_display_name(user)
             return response.session.access_token
         except Exception as exc:
             if isinstance(exc, AuthError):
@@ -139,6 +160,7 @@ class SupabaseAuth:
             email = getattr(user, "email", None)
             if user is None or not email:
                 raise AuthError("Google sign-in did not return a verified user. Please try again.")
+            self._display_name = _verified_display_name(user)
             return response.session.access_token, email
         except Exception as exc:
             if isinstance(exc, AuthError):
@@ -156,5 +178,5 @@ class SupabaseAuth:
 
 
 def clear_session(session_state: Any) -> None:
-    for key in ("access_token", "auth_email", "auth_csrf_token", "browser_authenticated", "latest_result", "latest_upload", "oauth_error", "oauth_success"):
+    for key in ("access_token", "auth_email", "auth_csrf_token", "browser_authenticated", "auth_profile", "auth_user_metadata", "auth_display_name", "full_name", "name", "display_name", "latest_result", "latest_upload", "oauth_error", "oauth_success"):
         session_state.pop(key, None)

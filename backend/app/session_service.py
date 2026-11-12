@@ -26,6 +26,7 @@ class RefreshedTokens:
     access_token: str
     refresh_token: str
     expires_at: float
+    display_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class ResolvedSession:
     access_token: str
     csrf_token: str
     absolute_expires_at: float
+    display_name: str | None = None
 
 
 @dataclass
@@ -47,6 +49,7 @@ class _SessionRecord:
     idle_expires_at: float
     absolute_expires_at: float
     csrf_token: str
+    display_name: str | None = None
     lock: Lock = field(default_factory=Lock)
     revoked: bool = False
 
@@ -79,6 +82,7 @@ class SessionStore:
         access_token: str,
         refresh_token: str,
         access_expires_at: float,
+        display_name: str | None = None,
     ) -> str:
         if not email or not access_token or not refresh_token:
             raise ValueError("A verified user and both Supabase tokens are required.")
@@ -93,6 +97,7 @@ class SessionStore:
             idle_expires_at=min(now + self._idle_ttl_seconds, now + self._absolute_ttl_seconds),
             absolute_expires_at=now + self._absolute_ttl_seconds,
             csrf_token=token_urlsafe(32),
+            display_name=display_name,
         )
         with self._lock:
             self._purge_locked(now)
@@ -117,6 +122,7 @@ class SessionStore:
                     if updated.user_id != record.user_id or not updated.access_token or not updated.refresh_token:
                         raise InvalidSession("The refreshed session identity is invalid.")
                     record.email = updated.email or record.email
+                    record.display_name = updated.display_name or record.display_name
                     record.access_token = updated.access_token
                     record.refresh_token = updated.refresh_token
                     record.access_expires_at = updated.expires_at
@@ -132,6 +138,7 @@ class SessionStore:
                 access_token=record.access_token,
                 csrf_token=record.csrf_token,
                 absolute_expires_at=record.absolute_expires_at,
+                display_name=record.display_name,
             )
 
     def revoke(self, session_id: str) -> _SessionRecord | None:
@@ -146,6 +153,7 @@ class SessionStore:
                     return None
                 self._sessions.pop(session_digest, None)
                 record.revoked = True
+                record.display_name = None
             return record
 
     def validate_csrf(self, session_id: str, csrf_token: str) -> bool:
@@ -178,9 +186,11 @@ class SessionStore:
             if self._sessions.get(session_digest) is record:
                 self._sessions.pop(session_digest, None)
             record.revoked = True
+            record.display_name = None
 
     def _purge_locked(self, now: float) -> None:
         for session_digest, record in list(self._sessions.items()):
             if self._expired(record, now):
                 self._sessions.pop(session_digest, None)
                 record.revoked = True
+                record.display_name = None

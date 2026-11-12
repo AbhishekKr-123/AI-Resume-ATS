@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from backend.app.auth_routes import ProviderSession, RedactOAuthAccessLog, create_auth_router
+from backend.app.auth_routes import ProviderSession, RedactOAuthAccessLog, SupabaseOAuthProvider, create_auth_router
 from backend.app.oauth_flow_store import OAuthFlowStore
 from backend.app.session_service import RefreshedTokens, SessionStore
 
@@ -38,6 +38,7 @@ class FakeProvider:
             "access-one",
             "refresh-one",
             self.expires_at,
+            "Abhishek Kumar",
         )
 
     def refresh(self, refresh_token):
@@ -48,6 +49,7 @@ class FakeProvider:
             "access-two",
             "refresh-two",
             time() + 3_600,
+            "Abhishek Kumar",
         )
 
     def sign_out(self, access_token, refresh_token):
@@ -143,7 +145,22 @@ def test_session_refresh_rotates_token_once(settings):
     second = client.get("/auth/session")
     assert first.status_code == second.status_code == 200
     assert first.json()["email"] == "user@example.test"
+    assert first.json()["display_name"] == "Abhishek Kumar"
+    assert {"access_token", "refresh_token", "code_verifier"}.isdisjoint(first.json())
     assert provider.refresh_calls == ["refresh-one"]
+
+
+def test_supabase_google_user_metadata_resolves_verified_display_name():
+    user = type("User", (), {
+        "id": uuid4(), "email": "user@example.test",
+        "user_metadata": {"full_name": "  Abhishek   Kumar  ", "name": "Lower priority"},
+        "profile": {"full_name": "Profile Name"},
+    })()
+    session = type("Session", (), {
+        "access_token": "access", "refresh_token": "refresh", "expires_at": time() + 3_600,
+    })()
+    resolved = SupabaseOAuthProvider._provider_session(user, session)
+    assert resolved.display_name == "Abhishek Kumar"
 
 
 def test_logout_requires_origin_and_csrf_then_invalidates_session(settings):

@@ -7,7 +7,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from frontend.api_client import ApiClient, ApiError, DOCX_MIME, PDF_MIME
-from frontend.app import PAGES, _browser_logout_html, _dashboard_history, _dashboard_metrics, _history_analysis, _latest_breakdown, _oauth_link_html, _render_password_reset, _score_chart_data, _upload_limit_mib, _validate_upload, check_backend
+from frontend.app import LOGO_PATH, PAGES, STYLESHEET_PATH, _asset_data_uri, _browser_logout_html, _dashboard_history, _dashboard_metrics, _display_name, _history_analysis, _latest_breakdown, _oauth_link_html, _render_password_reset, _score_chart_data, _upload_limit_mib, _validate_upload, check_backend
 from frontend.auth import AuthError, SupabaseAuth, _safe_auth_message, _safe_diagnostic_message, clear_session, normalize_email
 from frontend.config import FrontendSettings, is_publishable_key, load_frontend_settings
 from frontend.oauth_storage import OAuthFlowStorage, consume_verifier
@@ -36,7 +36,7 @@ def navigation_query_app() -> None:
     st.write(f"Selected: {page}")
 
 
-def dashboard_test_app(populated: bool = True) -> None:
+def dashboard_test_app(populated: bool = True, display_name: str | None = None) -> None:
     import streamlit as st
     from frontend.app import render_dashboard
 
@@ -56,6 +56,8 @@ def dashboard_test_app(populated: bool = True) -> None:
 
     st.session_state.browser_authenticated = True
     st.session_state.auth_email = "person@example.test"
+    if display_name:
+        st.session_state.auth_user_metadata = {"full_name": display_name}
     render_dashboard(Client())
 
 
@@ -124,6 +126,18 @@ def incomplete_analysis_result_test_app() -> None:
 def shared_css_test_app() -> None:
     from frontend.app import _css
     _css()
+
+
+def sidebar_test_app(current: str = "Dashboard") -> None:
+    import streamlit as st
+    from frontend.app import PAGES, _render_sidebar
+    from frontend.config import FrontendSettings
+
+    st.session_state.guest_mode = True
+    selected = st.query_params.get("page")
+    effective_current = selected if selected in PAGES else current
+    with st.sidebar:
+        _render_sidebar(FrontendSettings("https://api.test", None, None, 5 * 1024 * 1024), effective_current)
 
 
 def response_handler(request: httpx.Request) -> httpx.Response:
@@ -430,15 +444,15 @@ def test_shared_css_preserves_streamlit_icon_fonts_and_labels_uploader_once():
     app = AppTest.from_function(shared_css_test_app).run()
     stylesheet = " ".join(item.value for item in app.markdown)
     assert "[class*='st-']" not in stylesheet
-    assert "content:'Browse files'" in stylesheet
-    assert "stFileUploaderDropzone'] button>*{display:none" in stylesheet
-    assert "stSidebarContent']{padding-top:1.25rem;overflow-x:hidden" in stylesheet
+    assert 'content: "Browse files"' in stylesheet
+    assert '[data-testid="stFileUploaderDropzone"] button > *' in stylesheet
+    assert '[data-testid="stSidebar"] [data-testid="stSidebarContent"]' in stylesheet
 
 
 def test_heading_anchor_css_targets_only_streamlit_heading_links():
     app = AppTest.from_function(shared_css_test_app).run()
     stylesheet = " ".join(item.value for item in app.markdown)
-    assert "[data-testid='stHeaderActionElements'] a[aria-label='Link to heading']{display:none!important}" in stylesheet
+    assert '[data-testid="stHeaderActionElements"] a[aria-label="Link to heading"]' in stylesheet
     assert ".oauth-button" in stylesheet
     assert "a{display:none" not in stylesheet
 
@@ -461,13 +475,39 @@ def test_browse_action_state_tracks_upload_and_remove_nonce_workflow():
 def test_analysis_spacing_centered_actions_and_typography_rules_are_present():
     app = AppTest.from_function(shared_css_test_app).run()
     stylesheet = " ".join(item.value for item in app.markdown)
-    assert "stVerticalBlockBorderWrapper']:has(.upload-selected-marker)" in stylesheet
-    assert ".selected-file{display:flex" in stylesheet and "margin-top:18px" in stylesheet
-    assert ":has(.analysis-action-marker){align-items:stretch;gap:1rem}" in stylesheet
-    assert ":has(.analysis-action-marker){flex-direction:column;align-items:center}" in stylesheet
-    assert ".stApp{background:var(--canvas);color:var(--navy);font-size:16px" in stylesheet
-    assert "h1{font-size:1.9rem" in stylesheet
-    assert ".stButton>button,.stLinkButton>a{border-radius:9px;font-size:.9rem" in stylesheet
+    assert 'stVerticalBlockBorderWrapper"]:has(.upload-selected-marker)' in stylesheet
+    assert ".selected-file" in stylesheet and "margin-top: 18px" in stylesheet
+    assert ':has(.analysis-action-marker)' in stylesheet and "align-items: stretch" in stylesheet
+    assert "flex-direction: column" in stylesheet and "align-items: center" in stylesheet
+    assert ".stApp" in stylesheet and "font-size: 16px" in stylesheet
+    assert "font-size: 2rem !important" in stylesheet
+    assert ".stButton > button" in stylesheet and "font-size: 0.9rem" in stylesheet
+
+
+def test_light_dashboard_stylesheet_is_external_complete_and_cwd_independent(tmp_path, monkeypatch):
+    assert STYLESHEET_PATH.is_absolute()
+    assert STYLESHEET_PATH.name == "main.css"
+    monkeypatch.chdir(tmp_path)
+    stylesheet = STYLESHEET_PATH.read_text(encoding="utf-8")
+    assert "--canvas: #f7f8fa" in stylesheet
+    assert "--brand: #2563eb" in stylesheet
+    assert "#6d5dfc" not in stylesheet.lower()
+    for section in (
+        "Design tokens", "Global typography", "Sidebar and branding", "Navigation",
+        "Page headers", "Cards and containers", "Buttons", "Forms and inputs",
+        "File uploader", "Tables and history", "Dashboard charts", "Status messages",
+        "Authentication pages", "Responsive layouts",
+    ):
+        assert section in stylesheet
+
+
+def test_app_loads_one_external_stylesheet_before_all_page_rendering():
+    source = (STYLESHEET_PATH.parent.parent / "app.py").read_text(encoding="utf-8")
+    assert 'STYLESHEET_PATH = Path(__file__).resolve().parent / "styles" / "main.css"' in source
+    assert "STYLESHEET_PATH.read_text(encoding='utf-8')" in source
+    assert 'st.markdown("""<style>' not in source
+    assert source.count("def _css()") == 1
+    assert source.index("_css(); settings = load_frontend_settings()") < source.index("render_sign_in(settings)")
 
 
 def test_dashboard_populated_and_empty_states_render_actual_metrics():
@@ -484,6 +524,71 @@ def test_dashboard_populated_and_empty_states_render_actual_metrics():
     rendered = " ".join(item.value for item in empty.markdown)
     assert "No score history yet" in rendered
     assert "No analyses yet" in rendered
+
+
+def test_dashboard_uses_profile_display_name_and_never_greets_with_email():
+    assert _display_name({"profile": {"full_name": "  Abhishek   Kumar  "}, "user_metadata": {"name": "Other"}}) == "Abhishek Kumar"
+    assert _display_name({"user_metadata": {"name": "Metadata Name"}}) == "Metadata Name"
+    assert _display_name({"email": "person@example.test"}) is None
+
+    named = AppTest.from_function(dashboard_test_app, args=(False, "Abhishek Kumar")).run()
+    named_markup = " ".join(item.value for item in named.markdown)
+    assert "Welcome back, Abhishek Kumar" in named_markup
+    assert "Welcome back, person@example.test" not in named_markup
+
+    unnamed = AppTest.from_function(dashboard_test_app, args=(False, None)).run()
+    unnamed_markup = " ".join(item.value for item in unnamed.markdown)
+    assert "Welcome back</h1>" in unnamed_markup
+    assert "Welcome back, person@example.test" not in unnamed_markup
+
+
+def test_sidebar_omits_status_panel_and_loads_original_svg_logo():
+    app = AppTest.from_function(sidebar_test_app).run()
+    rendered = " ".join(item.value for item in app.sidebar.markdown)
+    assert "AI Resume ATS" in rendered and "Resume Intelligence" in rendered
+    assert "data:image/svg+xml;base64," in rendered
+    assert "Backend" not in rendered and "Model" not in rendered
+    assert all(button.label != "Check status" for button in app.sidebar.button)
+
+    assert LOGO_PATH.is_file()
+    svg = LOGO_PATH.read_text(encoding="utf-8")
+    assert "AI Resume ATS logo" in svg
+    assert "folded corner" in svg
+    assert "#2563EB" in svg
+    assert _asset_data_uri(LOGO_PATH, "image/svg+xml").startswith("data:image/svg+xml;base64,")
+
+
+@pytest.mark.parametrize("target", PAGES)
+def test_icon_sidebar_preserves_all_navigation_actions(target):
+    current = "Analyze Resume" if target == "Dashboard" else "Dashboard"
+    app = AppTest.from_function(sidebar_test_app, args=(current,)).run()
+    assert app.sidebar.radio[0].options == list(PAGES)
+    app.sidebar.radio[0].set_value(target).run()
+    assert len(app.exception) == 0
+    assert app.query_params["page"] == target
+
+
+def test_sidebar_navigation_uses_four_valid_distinct_svg_assets_without_squares():
+    from xml.etree import ElementTree
+
+    stylesheet = STYLESHEET_PATH.read_text(encoding="utf-8")
+    assert '[data-testid="stRadioOption"] > div > div:first-child' in stylesheet
+    assert stylesheet.count('background-image: url("data:image/svg+xml;base64,') == 4
+    assert "mask-image" not in stylesheet
+    for index in range(1, 5):
+        assert f"label:nth-child({index})" in stylesheet
+    assert "stRadioOption\"]::before" in stylesheet
+    assets = [LOGO_PATH.parent / name for name in ("nav_dashboard.svg", "nav_analyze.svg", "nav_history.svg", "nav_profile.svg")]
+    contents = []
+    for asset in assets:
+        assert asset.is_file()
+        root = ElementTree.fromstring(asset.read_text(encoding="utf-8"))
+        assert root.attrib["viewBox"] == "0 0 24 24"
+        assert root.attrib["fill"] == "none"
+        assert root.attrib["stroke"] == "#2563EB"
+        assert not root.findall("{http://www.w3.org/2000/svg}rect")
+        contents.append(asset.read_bytes())
+    assert len(set(contents)) == 4
 
 
 @pytest.mark.parametrize(("label", "page"), [
@@ -514,7 +619,7 @@ def test_history_mapping_handles_older_or_incomplete_records_without_fabrication
 
 
 def test_clear_session_removes_token_and_transient_resume_state():
-    session = {"access_token": "secret", "auth_email": "a@example.test", "latest_result": {}, "latest_upload": b"x", "other": True}
+    session = {"access_token": "secret", "auth_email": "a@example.test", "auth_user_metadata": {"full_name": "Test User"}, "latest_result": {}, "latest_upload": b"x", "other": True}
     clear_session(session)
     assert session == {"other": True}
 
@@ -612,6 +717,19 @@ def test_signup_uses_publishable_key_and_normalized_email(monkeypatch):
     assert captured == {"url": "https://supabase.test", "key": "sb_publishable_safe-test-key", "payload": {"email": "person@example.test", "password": "password"}}
 
 
+def test_email_password_login_reads_verified_user_metadata_name(monkeypatch):
+    class PasswordAuth:
+        def sign_in_with_password(self, _):
+            user = type("User", (), {"user_metadata": {"full_name": "Abhishek Kumar"}, "profile": None})()
+            session = type("Session", (), {"access_token": "password-access", "user": user})()
+            return type("Response", (), {"session": session, "user": user})()
+    class PasswordClient: auth = PasswordAuth()
+    monkeypatch.setattr("frontend.auth.create_client", lambda *_: PasswordClient())
+    auth = SupabaseAuth("https://supabase.test", "sb_publishable_safe")
+    assert auth.login("user@example.test", "password") == "password-access"
+    assert auth.display_name == "Abhishek Kumar"
+
+
 def test_secret_key_is_rejected_before_supabase_client_is_created(monkeypatch):
     monkeypatch.setattr("frontend.auth.create_client", lambda *_: pytest.fail("secret key must not create a client"))
     with pytest.raises(AuthError, match="publishable key"):
@@ -670,7 +788,7 @@ def test_google_oauth_uses_publishable_client_and_exchanges_then_verifies_user(m
             return type("Response", (), {"session": type("Session", (), {"access_token": "oauth-access-token"})()})()
         def get_user(self, token):
             captured["verified_token"] = token
-            return type("UserResponse", (), {"user": type("User", (), {"email": "google.user@example.test"})()})()
+            return type("UserResponse", (), {"user": type("User", (), {"email": "google.user@example.test", "user_metadata": {"name": "Abhishek Kumar"}, "profile": None})()})()
     class GoogleClient: auth = GoogleAuth()
     def create(url, key, options=None):
         captured["url"] = url; captured["key"] = key
@@ -684,6 +802,7 @@ def test_google_oauth_uses_publishable_client_and_exchanges_then_verifies_user(m
     storage = captured["oauth_storage"]
     storage.set_item("supabase-auth-code-verifier", "persisted-verifier")
     assert auth.complete_google_callback("one-time-code", flow_id) == ("oauth-access-token", "google.user@example.test")
+    assert auth.display_name == "Abhishek Kumar"
     assert captured["oauth"] == {"provider": "google", "options": {"redirect_to": f"http://localhost:8501?oauth_flow={flow_id}"}}
     assert captured["exchange"] == {"auth_code": "one-time-code", "code_verifier": "persisted-verifier"}
     assert captured["verified_token"] == "oauth-access-token"

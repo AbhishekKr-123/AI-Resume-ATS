@@ -31,6 +31,22 @@ class ProviderSession:
     access_token: str
     refresh_token: str
     expires_at: float
+    display_name: str | None = None
+
+
+def _verified_display_name(user: Any) -> str | None:
+    """Resolve safe presentation metadata without deriving identity from email."""
+    sources = (getattr(user, "user_metadata", None), getattr(user, "profile", None))
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for field in ("full_name", "name"):
+            value = source.get(field)
+            if isinstance(value, str):
+                normalized = " ".join(value.split())
+                if normalized and "@" not in normalized:
+                    return normalized
+    return None
 
 
 class OAuthProvider(Protocol):
@@ -84,6 +100,7 @@ class SupabaseOAuthProvider:
             provider.access_token,
             provider.refresh_token,
             provider.expires_at,
+            provider.display_name,
         )
 
     def sign_out(self, access_token: str, refresh_token: str) -> None:
@@ -103,7 +120,7 @@ class SupabaseOAuthProvider:
             raise RuntimeError("Supabase returned an invalid authenticated session.") from exc
         if not email or not access_token or not refresh_token:
             raise RuntimeError("Supabase returned an incomplete authenticated session.")
-        return ProviderSession(user_id, email, access_token, refresh_token, expires_at)
+        return ProviderSession(user_id, email, access_token, refresh_token, expires_at, _verified_display_name(user))
 
 
 def _append_query(url: str, values: dict[str, str]) -> str:
@@ -220,6 +237,7 @@ def create_auth_router(
                 authenticated.access_token,
                 authenticated.refresh_token,
                 authenticated.expires_at,
+                authenticated.display_name,
             )
         except HTTPException:
             raise
@@ -239,6 +257,7 @@ def create_auth_router(
         return {
             "authenticated": True,
             "email": resolved.email,
+            "display_name": resolved.display_name,
             "csrf_token": resolved.csrf_token,
             "expires_at": resolved.absolute_expires_at,
         }
