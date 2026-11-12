@@ -8,6 +8,7 @@ import logging
 import json
 import html
 import base64
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -27,12 +28,18 @@ if str(PROJECT_ROOT) not in sys.path:
 from frontend.api_client import ApiClient, ApiError
 from frontend.auth import AuthError, SupabaseAuth, clear_session
 from frontend.components.feedback_display import render_feedback
-from frontend.components.score_display import render_analysis, score_band
+from frontend.components.score_display import score_band
 from frontend.config import FrontendSettings, load_frontend_settings
 
 logger = logging.getLogger(__name__)
 
 PAGES = ("Dashboard", "Analyze Resume", "Analysis History", "Profile")
+NAVIGATION_ICONS = {
+    "Dashboard": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m3 11 9-8 9 8"/><path d="M5 10v10h14V10M9 20v-6h6v6"/></svg>',
+    "Analyze Resume": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><circle cx="11.5" cy="15" r="2.75"/><path d="m16.5 20-3-3"/></svg>',
+    "Analysis History": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg>',
+    "Profile": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>',
+}
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 SCORE_COMPONENTS = (
     ("semantic_similarity", "Semantic Similarity"),
@@ -127,6 +134,28 @@ def _session_display_name() -> str | None:
 def _asset_data_uri(path: Path, mime_type: str) -> str:
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def _navigation_icon_uri(page: str, active: bool) -> str:
+    color = "#2563EB" if active else "#64748B"
+    svg = NAVIGATION_ICONS[page].replace("currentColor", color)
+    encoded = base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    return f"data:image/svg+xml;base64,{encoded}"
+
+
+def _sidebar_navigation_html(current: str) -> str:
+    items = []
+    for page in PAGES:
+        active = " active" if page == current else ""
+        href = f"?{urlencode({'page': page})}"
+        current_attribute = ' aria-current="page"' if page == current else ""
+        icon_uri = _navigation_icon_uri(page, page == current)
+        items.append(
+            f'<a class="sidebar-nav-item{active}" href="{html.escape(href, quote=True)}" target="_self"{current_attribute}>'
+            f'<img class="sidebar-nav-icon" src="{icon_uri}" width="21" height="21" alt=""/>'
+            f'<span>{html.escape(page)}</span></a>'
+        )
+    return '<nav class="sidebar-nav" aria-label="Workspace navigation">' + "".join(items) + "</nav>"
 
 
 def _restore_browser_session(settings: FrontendSettings) -> None:
@@ -342,7 +371,7 @@ def _history_analysis(record: dict[str, Any]) -> dict[str, Any]:
         })
 
     return {
-        "overall_ats_score": record.get("overall_score", 0), "maximum_score": 100.0,
+        "overall_ats_score": record.get("overall_score"), "maximum_score": 100.0,
         "methodology_version": "deterministic-ats-v1",
         "disclaimer": "This deterministic ATS indicator is not a hiring probability or a guarantee of selection.",
         "components": components, "matched_skills": record.get("matched_skills", []),
@@ -759,35 +788,185 @@ def render_analyze(settings: FrontendSettings, client: ApiClient) -> None:
         _render_analyze_result(result)
 
 
+def _history_score(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    score = float(value)
+    return score if math.isfinite(score) else None
+
+
+def _history_record_html(record: dict[str, Any]) -> str:
+    filename_value = record.get("filename")
+    filename = str(filename_value).strip() if isinstance(filename_value, str) and filename_value.strip() else "Untitled resume"
+    date = _analysis_date(record.get("created_at"))
+    score = _history_score(record.get("overall_score"))
+    if score is None:
+        score_value, score_caption = "—", "Score unavailable"
+        status, status_class = "Unavailable", "unavailable"
+    else:
+        score_value, score_caption = f"{score:.1f}", "ATS score"
+        status = score_band(score)
+        status_class = status.lower().replace(" ", "-")
+    return (
+        '<div class="history-record-summary">'
+        f'<div class="history-file"><span>RESUME</span><b>{html.escape(filename)}</b></div>'
+        f'<div class="history-date"><span>ANALYZED</span><b>{html.escape(date)}</b></div>'
+        f'<div class="history-score"><span>{html.escape(score_caption.upper())}</span><b>{html.escape(score_value)}</b></div>'
+        f'<div class="history-status"><span>STATUS</span><i class="score-badge {status_class}">{html.escape(status)}</i></div>'
+        '</div>'
+    )
+
+
+def _render_history_details(record: dict[str, Any]) -> None:
+    analysis = _history_analysis(record)
+    score = _history_score(record.get("overall_score"))
+    filename = record.get("filename") if isinstance(record.get("filename"), str) and record.get("filename") else "Untitled resume"
+    st.markdown("<div class='history-details-heading'><span>SELECTED ANALYSIS</span><h2>Analysis details</h2><p>Review the persisted scores, requirements, and evidence for this resume.</p></div>", unsafe_allow_html=True)
+
+    with st.container(border=True):
+        st.markdown("<span class='history-details-marker'></span>", unsafe_allow_html=True)
+        score_column, context_column = st.columns((1, 3), vertical_alignment="center")
+        with score_column:
+            if score is None:
+                st.markdown("<div class='history-overall-score unavailable'><b>—</b><span>Score unavailable</span></div>", unsafe_allow_html=True)
+            else:
+                st.markdown(f"<div class='history-overall-score'><b>{score:.1f}</b><span>ATS score / 100</span></div>", unsafe_allow_html=True)
+        with context_column:
+            st.markdown(f"### {html.escape(str(filename))}")
+            st.caption(f"Analyzed {_analysis_date(record.get('created_at'))}")
+            st.caption(analysis["disclaimer"])
+
+    components = analysis.get("components") if isinstance(analysis.get("components"), dict) else {}
+    with st.container(border=True):
+        st.markdown("<div class='card-heading'><h3>Component scores</h3><p>Persisted scoring details from this analysis.</p></div>", unsafe_allow_html=True)
+        rendered = 0
+        for key, label in SCORE_COMPONENTS:
+            item = components.get(key)
+            if not isinstance(item, dict):
+                continue
+            component_score = _history_score(item.get("score"))
+            weight = item.get("weight")
+            weight_text = f"Weight {weight}%" if isinstance(weight, (int, float)) else "Weight unavailable"
+            score_text = f"{component_score:.1f}" if component_score is not None else "—"
+            width = max(0.0, min(100.0, component_score)) if component_score is not None else 0.0
+            st.markdown(
+                f'<div class="analysis-score-row"><div><span>{html.escape(label)}</span><small>{html.escape(weight_text)}</small><b>{score_text}</b></div><div class="score-track"><i style="width:{width:.1f}%"></i></div></div>',
+                unsafe_allow_html=True,
+            )
+            if explanation := item.get("explanation"):
+                st.caption(str(explanation))
+            rendered += 1
+        if not rendered:
+            st.caption("Component score details are unavailable for this historical record.")
+
+    matched_column, missing_column = st.columns(2)
+    with matched_column:
+        with st.container(border=True):
+            st.markdown("<div class='card-heading'><h3>Matched requirements</h3><p>Skills and keywords recorded as matches.</p></div>", unsafe_allow_html=True)
+            _render_requirement_group("Matched skills", analysis.get("matched_skills"), "No matched skills were recorded.")
+            _render_requirement_group("Matched keywords", analysis.get("matched_keywords"), "No matched keywords were recorded.")
+    with missing_column:
+        with st.container(border=True):
+            st.markdown("<div class='card-heading'><h3>Missing requirements</h3><p>Skills and keywords recorded as gaps.</p></div>", unsafe_allow_html=True)
+            _render_requirement_group("Missing skills", analysis.get("missing_skills"), "No missing skills were recorded.", "missing")
+            _render_requirement_group("Missing keywords", analysis.get("missing_keywords"), "No missing keywords were recorded.", "missing")
+
+    evidence_column, improvement_column = st.columns(2)
+    with evidence_column:
+        with st.container(border=True):
+            st.markdown("<div class='card-heading'><h3>Resume evidence</h3><p>Persisted semantic evidence from the resume.</p></div>", unsafe_allow_html=True)
+            evidence = _list_value(analysis.get("relevant_resume_evidence"))
+            if not evidence:
+                st.caption("No resume evidence was recorded for this analysis.")
+            for item in evidence:
+                if isinstance(item, dict):
+                    section = str(item.get("resume_section", "Resume section")).replace("_", " ").title()
+                    similarity = item.get("similarity")
+                    suffix = f" · {float(similarity) * 100:.1f}% similarity" if isinstance(similarity, (int, float)) else ""
+                    st.markdown(f"- **{section}**{suffix}")
+                else:
+                    st.write(f"- {item}")
+    with improvement_column:
+        with st.container(border=True):
+            st.markdown("<div class='card-heading'><h3>Improvement areas</h3><p>Persisted component gaps and missing requirements.</p></div>", unsafe_allow_html=True)
+            areas = _list_value(analysis.get("areas_needing_improvement"))
+            if not areas:
+                st.caption("No improvement areas were recorded for this analysis.")
+            for area in areas:
+                if not isinstance(area, dict):
+                    st.write(f"- {area}")
+                    continue
+                component = str(area.get("component", "Component")).replace("_", " ").title()
+                st.markdown(f"**{component}**")
+                missing = _list_value(area.get("missing_requirements"))
+                if missing:
+                    for requirement in missing:
+                        st.write(f"- {requirement}")
+                else:
+                    st.caption("No specific missing requirements were recorded.")
+
+    feedback = record.get("feedback")
+    if isinstance(feedback, dict) and feedback:
+        with st.container(border=True):
+            render_feedback(feedback)
+
+
 def render_history(client: ApiClient) -> None:
     st.markdown("<div class='dashboard-header'><span>RESUME LIBRARY</span><h1>Analysis History</h1><p>Review saved resume evaluations, scores, and detailed results.</p></div>", unsafe_allow_html=True)
     if not _is_authenticated():
         st.info("Sign in to access your saved analysis history."); return
     offset = st.session_state.get("history_offset", 0)
-    try: rows = client.history(_token(), limit=10, offset=offset).get("analyses", [])
+    try:
+        payload = client.history(_token(), limit=10, offset=offset)
+        raw_rows = payload.get("analyses", []) if isinstance(payload, dict) else []
+        rows = raw_rows if isinstance(raw_rows, list) else []
     except ApiError as exc: st.error(_friendly_api_error(exc)); return
-    if not rows: st.info("No analyses on this page. Analyze a resume to create your history.")
-    for row in rows:
-        with st.expander(f"{row.get('filename') or 'Untitled resume'} · {row.get('overall_score', 0):.1f}/100 · {row.get('created_at', '')}"):
-            left, right = st.columns(2)
-            if left.button("View details", key=f"open-{row['id']}"):
-                try: st.session_state.selected_analysis = client.get_analysis(row["id"], _token())
-                except ApiError as exc: st.error(_friendly_api_error(exc))
-            if right.button("Delete", key=f"delete-{row['id']}"):
-                st.session_state.confirm_delete = row["id"]
-            if st.session_state.get("confirm_delete") == row["id"]:
+    if not rows:
+        with st.container(border=True):
+            st.markdown("<div class='history-empty'><b>No saved analyses on this page</b><span>Analyze a resume to create a saved result and start building your history.</span></div>", unsafe_allow_html=True)
+            if st.button("Analyze Resume", type="primary", key="history_empty_analyze"):
+                _set_page("Analyze Resume")
+    else:
+        st.caption(f"Showing {len(rows)} saved {'analysis' if len(rows) == 1 else 'analyses'}")
+    for index, raw_row in enumerate(rows):
+        row = raw_row if isinstance(raw_row, dict) else {}
+        analysis_id = row.get("id")
+        record_key = str(analysis_id) if analysis_id else f"record-{offset + index}"
+        with st.container(border=True):
+            st.markdown("<span class='history-card-marker'></span>", unsafe_allow_html=True)
+            st.markdown(_history_record_html(row), unsafe_allow_html=True)
+            action_spacer, view_action, delete_action = st.columns((3.5, 1.25, 1), vertical_alignment="center")
+            action_spacer.markdown("<span class='history-actions-marker'></span>", unsafe_allow_html=True)
+            if view_action.button("View details", key=f"open-{record_key}", width="stretch", disabled=not bool(analysis_id)):
+                try:
+                    selected = client.get_analysis(analysis_id, _token())
+                    st.session_state.selected_analysis = selected if isinstance(selected, dict) else {}
+                except ApiError as exc:
+                    st.error(_friendly_api_error(exc))
+            if delete_action.button("Delete", key=f"delete-{record_key}", width="stretch", disabled=not bool(analysis_id)):
+                st.session_state.confirm_delete = analysis_id
+            if analysis_id and st.session_state.get("confirm_delete") == analysis_id:
                 st.warning("Delete this saved analysis? This cannot be undone.")
-                yes, no = st.columns(2)
-                if yes.button("Confirm delete", key=f"confirm-{row['id']}"):
-                    try: client.delete_analysis(row["id"], _token()); st.session_state.pop("confirm_delete", None); st.session_state.pop("selected_analysis", None); st.rerun()
-                    except ApiError as exc: st.error(_friendly_api_error(exc))
-                if no.button("Cancel", key=f"cancel-{row['id']}"): st.session_state.pop("confirm_delete", None); st.rerun()
+                confirm_spacer, yes, no = st.columns((3.5, 1.25, 1))
+                confirm_spacer.write("")
+                if yes.button("Confirm delete", key=f"confirm-{record_key}", width="stretch"):
+                    try:
+                        client.delete_analysis(analysis_id, _token())
+                        st.session_state.pop("confirm_delete", None)
+                        st.session_state.pop("selected_analysis", None)
+                        st.rerun()
+                    except ApiError as exc:
+                        st.error(_friendly_api_error(exc))
+                if no.button("Cancel", key=f"cancel-{record_key}", width="stretch"):
+                    st.session_state.pop("confirm_delete", None)
+                    st.rerun()
     if selected := st.session_state.get("selected_analysis"):
-        st.divider(); st.subheader("Analysis details"); render_analysis(_history_analysis(selected))
-        if selected.get("feedback"): render_feedback(selected["feedback"])
-    previous, next_page = st.columns(2)
-    if previous.button("Previous", disabled=offset == 0): st.session_state.history_offset = max(0, offset - 10); st.rerun()
-    if next_page.button("Next", disabled=len(rows) < 10): st.session_state.history_offset = offset + 10; st.rerun()
+        _render_history_details(selected if isinstance(selected, dict) else {})
+    pagination_start, previous, next_page, pagination_end = st.columns((2, 1, 1, 2))
+    pagination_start.markdown("<span class='history-pagination-marker'></span>", unsafe_allow_html=True)
+    pagination_end.write("")
+    if previous.button("Previous", width="stretch", disabled=offset == 0): st.session_state.history_offset = max(0, offset - 10); st.rerun()
+    if next_page.button("Next", width="stretch", disabled=len(rows) < 10): st.session_state.history_offset = offset + 10; st.rerun()
 
 
 def render_profile(settings: FrontendSettings) -> None:
@@ -817,9 +996,7 @@ def _render_sidebar(settings: FrontendSettings, current: str) -> str:
     logo_uri = _asset_data_uri(LOGO_PATH, "image/svg+xml")
     st.markdown(f"<div class='sidebar-brand'><img class='sidebar-logo' src='{logo_uri}' alt='AI Resume ATS document and checkmark logo'><div><h2>AI Resume ATS</h2><p>Resume Intelligence</p></div></div>", unsafe_allow_html=True)
     st.markdown("<div class='sidebar-label'>WORKSPACE</div>", unsafe_allow_html=True)
-    page = st.radio("Navigation", PAGES, index=PAGES.index(current), label_visibility="collapsed")
-    if page != current:
-        _set_page(page)
+    st.html(_sidebar_navigation_html(current))
     st.divider()
     sidebar_identity = str(st.session_state.get("auth_email", "Guest mode"))
     sidebar_name = _session_display_name() if _is_authenticated() else None
@@ -836,7 +1013,7 @@ def _render_sidebar(settings: FrontendSettings, current: str) -> str:
         clear_session(st.session_state)
         st.session_state.pop("guest_mode", None)
         st.rerun()
-    return page
+    return current
 
 
 

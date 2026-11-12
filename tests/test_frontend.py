@@ -7,7 +7,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from frontend.api_client import ApiClient, ApiError, DOCX_MIME, PDF_MIME
-from frontend.app import LOGO_PATH, PAGES, STYLESHEET_PATH, _asset_data_uri, _browser_logout_html, _dashboard_history, _dashboard_metrics, _display_name, _history_analysis, _latest_breakdown, _oauth_link_html, _render_password_reset, _score_chart_data, _upload_limit_mib, _validate_upload, check_backend
+from frontend.app import LOGO_PATH, NAVIGATION_ICONS, PAGES, STYLESHEET_PATH, _asset_data_uri, _browser_logout_html, _dashboard_history, _dashboard_metrics, _display_name, _history_analysis, _latest_breakdown, _navigation_icon_uri, _oauth_link_html, _render_password_reset, _score_chart_data, _sidebar_navigation_html, _upload_limit_mib, _validate_upload, check_backend
 from frontend.auth import AuthError, SupabaseAuth, _safe_auth_message, _safe_diagnostic_message, clear_session, normalize_email
 from frontend.config import FrontendSettings, is_publishable_key, load_frontend_settings
 from frontend.oauth_storage import OAuthFlowStorage, consume_verifier
@@ -59,6 +59,68 @@ def dashboard_test_app(populated: bool = True, display_name: str | None = None) 
     if display_name:
         st.session_state.auth_user_metadata = {"full_name": display_name}
     render_dashboard(Client())
+
+
+def history_test_app(mode: str = "populated", preselect: bool = False) -> None:
+    import streamlit as st
+    from frontend.app import render_history
+
+    detail = {
+        "id": "analysis-1",
+        "overall_score": 78.5,
+        "filename": "backend-engineer.pdf",
+        "created_at": "2026-11-10T10:00:00Z",
+        "component_scores": {
+            "semantic_similarity": {
+                "score": 82,
+                "weight": 35,
+                "explanation": "Strong role alignment.",
+                "evidence": {"matches": [{"resume_section": "projects", "similarity": 0.82}]},
+                "missing_requirements": [],
+            },
+            "technical_skills": {"score": 76, "weight": 25, "missing_requirements": ["Kubernetes"]},
+            "keywords": {"score": 70, "weight": 15, "missing_requirements": ["observability"]},
+        },
+        "matched_skills": ["Python"],
+        "missing_skills": ["Kubernetes"],
+        "matched_keywords": ["APIs"],
+        "missing_keywords": ["observability"],
+        "feedback": {
+            "overall_feedback": "Add measurable production outcomes.",
+            "strengths": [], "missing_skills_feedback": [], "resume_improvements": [],
+            "project_recommendations": [], "action_plan": {},
+        },
+    }
+
+    class Client:
+        def history(self, token, limit=100, offset=0):
+            st.session_state.history_call = {"token": token, "limit": limit, "offset": offset}
+            if mode == "empty":
+                return {"analyses": []}
+            if mode == "malformed":
+                return {"analyses": [None, "legacy", {"id": "legacy-1", "filename": [], "created_at": 123, "overall_score": "unknown", "component_scores": None}]}
+            count = 10 if mode == "page" else 2
+            return {"analyses": [
+                detail,
+                *[
+                    {"id": f"analysis-{index}", "overall_score": 62.0, "filename": f"resume-{index}.pdf", "created_at": "2026-11-01T10:00:00Z", "component_scores": {}}
+                    for index in range(2, count + 1)
+                ],
+            ]}
+
+        def get_analysis(self, analysis_id, token):
+            st.session_state.history_get_call = {"id": analysis_id, "token": token}
+            return detail
+
+        def delete_analysis(self, analysis_id, token):
+            st.session_state.history_delete_call = {"id": analysis_id, "token": token}
+            return {"deleted": True}
+
+    st.session_state.browser_authenticated = True
+    st.session_state.access_token = "history-token"
+    if preselect:
+        st.session_state.selected_analysis = detail
+    render_history(Client())
 
 
 def analyze_upload_test_app() -> None:
@@ -341,6 +403,93 @@ def test_history_mapping_uses_only_persisted_response_fields():
     assert analysis["areas_needing_improvement"] == [{"component": "keywords", "missing_requirements": ["kubernetes"]}]
 
 
+def test_history_populated_state_preserves_api_contract_and_record_actions():
+    app = AppTest.from_function(history_test_app, args=("populated",)).run()
+    assert len(app.exception) == 0
+    assert app.session_state["history_call"] == {"token": "history-token", "limit": 10, "offset": 0}
+    rendered = " ".join(item.value for item in app.markdown)
+    assert "Analysis History" in rendered
+    assert "backend-engineer.pdf" in rendered
+    assert "78.5" in rendered and "Strong" in rendered
+    assert "Nov 10, 2026" in rendered
+    assert [button.label for button in app.button].count("View details") == 2
+    assert [button.label for button in app.button].count("Delete") == 2
+
+    next(button for button in app.button if button.label == "View details").click().run()
+    assert len(app.exception) == 0
+    assert app.session_state["history_get_call"] == {"id": "analysis-1", "token": "history-token"}
+    details = " ".join(item.value for item in app.markdown)
+    assert "Analysis details" in details
+    assert "Component scores" in details
+    assert "Matched requirements" in details and "Missing requirements" in details
+
+
+def test_history_empty_state_has_helpful_analyze_action():
+    app = AppTest.from_function(history_test_app, args=("empty",)).run()
+    assert len(app.exception) == 0
+    rendered = " ".join(item.value for item in app.markdown)
+    assert "No saved analyses on this page" in rendered
+    assert "start building your history" in rendered
+    analyze = next(button for button in app.button if button.label == "Analyze Resume")
+    analyze.click().run()
+    assert len(app.exception) == 0
+    assert app.query_params["page"] == "Analyze Resume"
+
+
+def test_history_malformed_records_render_unavailable_values_without_crashing():
+    app = AppTest.from_function(history_test_app, args=("malformed",)).run()
+    assert len(app.exception) == 0
+    rendered = " ".join(item.value for item in app.markdown)
+    assert rendered.count("Untitled resume") == 3
+    assert rendered.count("SCORE UNAVAILABLE") == 3
+    assert rendered.count("Date unavailable") == 3
+    view_buttons = [button for button in app.button if button.label == "View details"]
+    delete_buttons = [button for button in app.button if button.label == "Delete"]
+    assert [button.disabled for button in view_buttons] == [True, True, False]
+    assert [button.disabled for button in delete_buttons] == [True, True, False]
+
+
+def test_history_expanded_details_render_only_persisted_sections_and_feedback():
+    app = AppTest.from_function(history_test_app, args=("populated", True)).run()
+    assert len(app.exception) == 0
+    rendered = " ".join(item.value for item in app.markdown)
+    captions = " ".join(item.value for item in app.caption)
+    assert "Analysis details" in rendered
+    assert "Semantic Similarity" in rendered and "Technical Skills" in rendered
+    assert "Python" in rendered and "Kubernetes" in rendered
+    assert "Projects" in rendered and "82.0% similarity" in rendered
+    assert "Keywords" in rendered and "observability" in rendered
+    assert "Strong role alignment." in captions
+    assert "Add measurable production outcomes." in rendered
+
+
+def test_history_delete_confirmation_and_backend_pagination_are_preserved():
+    app = AppTest.from_function(history_test_app, args=("page",)).run()
+    assert next(button for button in app.button if button.label == "Next").disabled is False
+    next(button for button in app.button if button.label == "Next").click().run()
+    assert app.session_state["history_call"]["offset"] == 10
+    assert next(button for button in app.button if button.label == "Previous").disabled is False
+
+    next(button for button in app.button if button.label == "Delete").click().run()
+    assert app.warning[0].value == "Delete this saved analysis? This cannot be undone."
+    next(button for button in app.button if button.label == "Confirm delete").click().run()
+    assert len(app.exception) == 0
+    assert app.session_state["history_delete_call"] == {"id": "analysis-1", "token": "history-token"}
+    assert "confirm_delete" not in app.session_state
+
+
+def test_history_styles_include_responsive_cards_details_and_empty_state():
+    stylesheet = STYLESHEET_PATH.read_text(encoding="utf-8")
+    for selector in (
+        ".history-record-summary", ".history-score b", ".history-empty",
+        ".history-details-heading", ".history-overall-score", ".history-pagination-marker",
+    ):
+        assert selector in stylesheet
+    assert '@media (max-width: 900px)' in stylesheet
+    assert '@media (max-width: 640px)' in stylesheet
+    assert ':has(.history-actions-marker)' in stylesheet
+
+
 def test_dashboard_helpers_use_only_persisted_history_values():
     rows = [
         {"overall_score": 82.0, "filename": "latest.pdf", "created_at": "2026-11-10T10:00:00Z", "component_scores": {"semantic_similarity": {"score": 84}, "technical_skills": {"score": 80}, "keywords": {"score": 76}, "experience_relevance": {"score": 88}, "formatting_completeness": {"score": 90}}},
@@ -560,35 +709,54 @@ def test_sidebar_omits_status_panel_and_loads_original_svg_logo():
 
 @pytest.mark.parametrize("target", PAGES)
 def test_icon_sidebar_preserves_all_navigation_actions(target):
-    current = "Analyze Resume" if target == "Dashboard" else "Dashboard"
-    app = AppTest.from_function(sidebar_test_app, args=(current,)).run()
-    assert app.sidebar.radio[0].options == list(PAGES)
-    app.sidebar.radio[0].set_value(target).run()
+    from urllib.parse import quote_plus
+
+    markup = _sidebar_navigation_html(target)
+    assert f'href="?page={quote_plus(target)}"' in markup
+    assert f'<span>{target}</span>' in markup
+    assert markup.count('aria-current="page"') == 1
+
+    app = AppTest.from_function(navigation_query_app)
+    app.query_params["page"] = target
+    app.run()
     assert len(app.exception) == 0
-    assert app.query_params["page"] == target
+    assert app.radio[0].value == target
 
 
-def test_sidebar_navigation_uses_four_valid_distinct_svg_assets_without_squares():
+def test_sidebar_navigation_renders_four_distinct_svg_images_without_squares():
     from xml.etree import ElementTree
 
     stylesheet = STYLESHEET_PATH.read_text(encoding="utf-8")
-    assert '[data-testid="stRadioOption"] > div > div:first-child' in stylesheet
-    assert stylesheet.count('background-image: url("data:image/svg+xml;base64,') == 4
+    assert ".sidebar-nav-icon" in stylesheet
     assert "mask-image" not in stylesheet
-    for index in range(1, 5):
-        assert f"label:nth-child({index})" in stylesheet
-    assert "stRadioOption\"]::before" in stylesheet
-    assets = [LOGO_PATH.parent / name for name in ("nav_dashboard.svg", "nav_analyze.svg", "nav_history.svg", "nav_profile.svg")]
-    contents = []
-    for asset in assets:
-        assert asset.is_file()
-        root = ElementTree.fromstring(asset.read_text(encoding="utf-8"))
+    assert "data:image/svg+xml;base64" not in stylesheet
+    assert ".sidebar-nav-item.active" in stylesheet
+
+    assert set(NAVIGATION_ICONS) == set(PAGES)
+    assert len(set(NAVIGATION_ICONS.values())) == 4
+    for page, svg in NAVIGATION_ICONS.items():
+        root = ElementTree.fromstring(svg)
+        assert root.tag == "{http://www.w3.org/2000/svg}svg"
         assert root.attrib["viewBox"] == "0 0 24 24"
+        assert root.attrib["width"] == root.attrib["height"] == "21"
         assert root.attrib["fill"] == "none"
-        assert root.attrib["stroke"] == "#2563EB"
-        assert not root.findall("{http://www.w3.org/2000/svg}rect")
-        contents.append(asset.read_bytes())
-    assert len(set(contents)) == 4
+        assert root.attrib["stroke"] == "currentColor"
+        assert len(root) > 0, page
+        active_svg = base64.b64decode(_navigation_icon_uri(page, True).split(",", 1)[1]).decode("utf-8")
+        inactive_svg = base64.b64decode(_navigation_icon_uri(page, False).split(",", 1)[1]).decode("utf-8")
+        assert "#2563EB" in active_svg and "#64748B" not in active_svg
+        assert "#64748B" in inactive_svg and "#2563EB" not in inactive_svg
+
+    rendered = _sidebar_navigation_html("Dashboard")
+    root = ElementTree.fromstring(rendered)
+    links = list(root)
+    assert len(links) == 4
+    for link, page in zip(links, PAGES):
+        image = link.find("img")
+        assert image is not None
+        assert image.attrib["width"] == image.attrib["height"] == "21"
+        assert image.attrib["src"].startswith("data:image/svg+xml;base64,")
+        assert link.find("span").text == page
 
 
 @pytest.mark.parametrize(("label", "page"), [
