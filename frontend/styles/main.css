@@ -750,6 +750,27 @@ label,
   color: var(--error);
 }
 
+.requirement-list.improvement-requirements {
+  margin: 0.4rem 0 0.75rem;
+}
+
+[data-testid="stExpander"]:has(.scoring-methodology-marker) {
+  background: #f8fafc;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius-control) !important;
+  margin-top: 0.8rem;
+}
+
+[data-testid="stExpander"]:has(.scoring-methodology-marker) summary {
+  color: var(--navy);
+  font-size: 0.86rem;
+  font-weight: 650;
+}
+
+.scoring-methodology-marker {
+  display: none;
+}
+
 /* ================================================================
    Tables and history
    ================================================================ */
@@ -842,7 +863,7 @@ label,
 }
 
 .history-details-heading {
-  padding: 2rem 0 0.85rem;
+  padding: 0.75rem 0 0.85rem;
 }
 
 .history-details-heading > span {

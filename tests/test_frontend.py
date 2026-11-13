@@ -80,7 +80,7 @@ def history_test_app(mode: str = "populated", preselect: bool = False) -> None:
                 "missing_requirements": [],
             },
             "technical_skills": {"score": 76, "weight": 25, "missing_requirements": ["Kubernetes"]},
-            "keywords": {"score": 70, "weight": 15, "missing_requirements": ["observability"]},
+            "keywords": {"score": 69, "weight": 15, "missing_requirements": ["observability"]},
         },
         "matched_skills": ["Python"],
         "missing_skills": ["Kubernetes"],
@@ -111,6 +111,8 @@ def history_test_app(mode: str = "populated", preselect: bool = False) -> None:
 
         def get_analysis(self, analysis_id, token):
             st.session_state.history_get_call = {"id": analysis_id, "token": token}
+            if mode == "unavailable":
+                return {}
             return detail
 
         def delete_analysis(self, analysis_id, token):
@@ -486,6 +488,14 @@ def test_history_populated_state_preserves_api_contract_and_record_actions():
     assert "Analysis details" in details
     assert "Component scores" in details
     assert "Matched requirements" in details and "Missing requirements" in details
+    assert "history-record-summary" not in details
+    assert not any(button.label == "View details" for button in app.button)
+    assert app.button[0].label == "← Back to History"
+
+    app.button[0].click().run()
+    assert len(app.exception) == 0
+    assert "selected_analysis" not in app.session_state
+    assert any(button.label == "View details" for button in app.button)
 
 
 def test_history_empty_state_has_helpful_analyze_action():
@@ -525,12 +535,33 @@ def test_history_expanded_details_render_only_persisted_sections_and_feedback():
     assert "Keywords" in rendered and "observability" in rendered
     assert "Strong role alignment." in captions
     assert "Add measurable production outcomes." in rendered
+    assert len(app.expander) == 1
+    assert app.expander[0].label == "How scoring works"
+    assert app.expander[0].proto.expanded is False
+    assert "Strong role alignment." in " ".join(item.value for item in app.expander[0].caption)
+    assert any("improvement-requirements" in item.value and "observability" in item.value for item in app.markdown)
+
+
+def test_history_unavailable_detail_stays_on_list_with_clear_error():
+    app = AppTest.from_function(history_test_app, args=("unavailable",)).run()
+    next(button for button in app.button if button.label == "View details").click().run()
+    assert len(app.exception) == 0
+    assert app.error[0].value == "This saved analysis is unavailable or could not be loaded."
+    assert "selected_analysis" not in app.session_state
+    assert any(button.label == "View details" for button in app.button)
 
 
 def test_history_delete_confirmation_and_backend_pagination_are_preserved():
     app = AppTest.from_function(history_test_app, args=("page",)).run()
     assert next(button for button in app.button if button.label == "Next").disabled is False
     next(button for button in app.button if button.label == "Next").click().run()
+    assert app.session_state["history_call"]["offset"] == 10
+    assert next(button for button in app.button if button.label == "Previous").disabled is False
+
+    next(button for button in app.button if button.label == "View details").click().run()
+    assert app.button[0].label == "← Back to History"
+    assert not any(button.label == "Next" for button in app.button)
+    app.button[0].click().run()
     assert app.session_state["history_call"]["offset"] == 10
     assert next(button for button in app.button if button.label == "Previous").disabled is False
 
@@ -616,6 +647,34 @@ def test_pdf_and_docx_analysis_submission_preserves_existing_api_contract(filena
     assert "Python" in rendered and "Kubernetes" in rendered
     assert "Projects" in rendered and "Keywords" in rendered
     assert "AI feedback not generated" in rendered
+
+
+def test_analysis_scoring_is_compact_and_improvement_keywords_use_wrapping_chips():
+    app = AppTest.from_function(analyze_workflow_test_app).run()
+    app.file_uploader[0].upload("resume.pdf", b"pdf", PDF_MIME).run()
+    app.text_area[0].input("Python API role").run()
+    next(button for button in app.button if button.label == "Analyze Resume").click().run()
+    assert len(app.exception) == 0
+
+    assert len(app.expander) == 1
+    methodology = app.expander[0]
+    assert methodology.label == "How scoring works"
+    assert methodology.proto.expanded is False
+    methodology_captions = " ".join(item.value for item in methodology.caption)
+    for explanation in (
+        "Semantic explanation", "Skills explanation", "Keywords explanation",
+        "Experience explanation", "Formatting explanation",
+    ):
+        assert explanation in methodology_captions
+
+    chip_markup = [item.value for item in app.markdown if "improvement-requirements" in item.value]
+    assert len(chip_markup) == 1
+    assert 'class="requirement-chip missing"' in chip_markup[0]
+    assert "observability" in chip_markup[0]
+    stylesheet = STYLESHEET_PATH.read_text(encoding="utf-8")
+    assert ".requirement-list" in stylesheet
+    assert "flex-wrap: wrap" in stylesheet
+    assert ".requirement-chip.missing" in stylesheet
 
 
 def test_generate_feedback_uses_feedback_endpoint_and_renders_only_returned_feedback():

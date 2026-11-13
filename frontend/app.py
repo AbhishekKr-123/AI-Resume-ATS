@@ -444,17 +444,33 @@ def _list_value(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def _render_requirement_chips(values: Any, tone: str = "matched", extra_class: str = "") -> None:
+    items = _list_value(values)
+    classes = " ".join(value for value in ("requirement-list", extra_class) if value)
+    chips = "".join(
+        f'<span class="requirement-chip {tone}">{html.escape(str(item))}</span>'
+        for item in items
+    )
+    st.markdown(f'<div class="{classes}">{chips}</div>', unsafe_allow_html=True)
+
+
 def _render_requirement_group(title: str, values: Any, empty_message: str, tone: str = "matched") -> None:
     items = _list_value(values)
     st.markdown(f"**{title}**")
     if not items:
         st.caption(empty_message)
         return
-    chips = "".join(
-        f'<span class="requirement-chip {tone}">{html.escape(str(item))}</span>'
-        for item in items
-    )
-    st.markdown(f'<div class="requirement-list">{chips}</div>', unsafe_allow_html=True)
+    _render_requirement_chips(items, tone)
+
+
+def _render_scoring_explanations(explanations: list[tuple[str, str]]) -> None:
+    if not explanations:
+        return
+    with st.expander("How scoring works", expanded=False):
+        st.markdown("<span class='scoring-methodology-marker'></span>", unsafe_allow_html=True)
+        for label, explanation in explanations:
+            st.markdown(f"**{html.escape(label)}**")
+            st.caption(explanation)
 
 
 def _render_analysis_feedback(feedback: dict[str, Any] | None) -> None:
@@ -531,6 +547,7 @@ def _render_analyze_result(result: dict[str, Any]) -> None:
     with st.container(border=True):
         st.markdown("<div class='card-heading'><h3>Component score breakdown</h3><p>The existing 35 / 25 / 15 / 15 / 10 weighted scoring components.</p></div>", unsafe_allow_html=True)
         rendered_components = 0
+        scoring_explanations: list[tuple[str, str]] = []
         for key, label in SCORE_COMPONENTS:
             item = components.get(key)
             if not isinstance(item, dict):
@@ -543,10 +560,11 @@ def _render_analyze_result(result: dict[str, Any]) -> None:
                 unsafe_allow_html=True,
             )
             if explanation := item.get("explanation"):
-                st.caption(explanation)
+                scoring_explanations.append((label, str(explanation)))
             rendered_components += 1
         if not rendered_components:
             st.info("Component score details were not included in this result.")
+        _render_scoring_explanations(scoring_explanations)
 
     requirements_left, requirements_right = st.columns(2)
     with requirements_left:
@@ -589,8 +607,7 @@ def _render_analyze_result(result: dict[str, Any]) -> None:
                 missing = _list_value(area.get("missing_requirements"))
                 st.markdown(f"**{component}**")
                 if missing:
-                    for requirement in missing:
-                        st.write(f"- {requirement}")
+                    _render_requirement_chips(missing, "missing", "improvement-requirements")
                 else:
                     st.caption("Review this component for additional alignment opportunities.")
 
@@ -881,6 +898,7 @@ def _render_history_details(record: dict[str, Any]) -> None:
     with st.container(border=True):
         st.markdown("<div class='card-heading'><h3>Component scores</h3><p>Persisted scoring details from this analysis.</p></div>", unsafe_allow_html=True)
         rendered = 0
+        scoring_explanations: list[tuple[str, str]] = []
         for key, label in SCORE_COMPONENTS:
             item = components.get(key)
             if not isinstance(item, dict):
@@ -895,10 +913,11 @@ def _render_history_details(record: dict[str, Any]) -> None:
                 unsafe_allow_html=True,
             )
             if explanation := item.get("explanation"):
-                st.caption(str(explanation))
+                scoring_explanations.append((label, str(explanation)))
             rendered += 1
         if not rendered:
             st.caption("Component score details are unavailable for this historical record.")
+        _render_scoring_explanations(scoring_explanations)
 
     matched_column, missing_column = st.columns(2)
     with matched_column:
@@ -941,8 +960,7 @@ def _render_history_details(record: dict[str, Any]) -> None:
                 st.markdown(f"**{component}**")
                 missing = _list_value(area.get("missing_requirements"))
                 if missing:
-                    for requirement in missing:
-                        st.write(f"- {requirement}")
+                    _render_requirement_chips(missing, "missing", "improvement-requirements")
                 else:
                     st.caption("No specific missing requirements were recorded.")
 
@@ -953,9 +971,22 @@ def _render_history_details(record: dict[str, Any]) -> None:
 
 
 def render_history(client: ApiClient) -> None:
-    st.markdown("<div class='dashboard-header'><span>RESUME LIBRARY</span><h1>Analysis History</h1><p>Review saved resume evaluations, scores, and detailed results.</p></div>", unsafe_allow_html=True)
     if not _is_authenticated():
+        st.markdown("<div class='dashboard-header'><span>RESUME LIBRARY</span><h1>Analysis History</h1><p>Review saved resume evaluations, scores, and detailed results.</p></div>", unsafe_allow_html=True)
         st.info("Sign in to access your saved analysis history."); return
+
+    if "selected_analysis" in st.session_state:
+        if st.button("← Back to History", key="history_back", width="content"):
+            st.session_state.pop("selected_analysis", None)
+            st.rerun()
+        selected = st.session_state.get("selected_analysis")
+        if isinstance(selected, dict) and selected:
+            _render_history_details(selected)
+        else:
+            st.warning("This saved analysis is unavailable or could not be loaded.")
+        return
+
+    st.markdown("<div class='dashboard-header'><span>RESUME LIBRARY</span><h1>Analysis History</h1><p>Review saved resume evaluations, scores, and detailed results.</p></div>", unsafe_allow_html=True)
     offset = st.session_state.get("history_offset", 0)
     try:
         payload = client.history(_token(), limit=10, offset=offset)
@@ -981,7 +1012,11 @@ def render_history(client: ApiClient) -> None:
             if view_action.button("View details", key=f"open-{record_key}", width="stretch", disabled=not bool(analysis_id)):
                 try:
                     selected = client.get_analysis(analysis_id, _token())
-                    st.session_state.selected_analysis = selected if isinstance(selected, dict) else {}
+                    if isinstance(selected, dict) and selected:
+                        st.session_state.selected_analysis = selected
+                        st.rerun()
+                    else:
+                        st.error("This saved analysis is unavailable or could not be loaded.")
                 except ApiError as exc:
                     st.error(_friendly_api_error(exc))
             if delete_action.button("Delete", key=f"delete-{record_key}", width="stretch", disabled=not bool(analysis_id)):
@@ -1001,8 +1036,6 @@ def render_history(client: ApiClient) -> None:
                 if no.button("Cancel", key=f"cancel-{record_key}", width="stretch"):
                     st.session_state.pop("confirm_delete", None)
                     st.rerun()
-    if selected := st.session_state.get("selected_analysis"):
-        _render_history_details(selected if isinstance(selected, dict) else {})
     pagination_start, previous, next_page, pagination_end = st.columns((2, 1, 1, 2))
     pagination_start.markdown("<span class='history-pagination-marker'></span>", unsafe_allow_html=True)
     pagination_end.write("")
