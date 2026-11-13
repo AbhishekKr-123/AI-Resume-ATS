@@ -1,5 +1,3 @@
--- Run manually in the Supabase SQL Editor after 001_create_analyses_table.sql.
--- Email remains authoritative in auth.users and is intentionally not duplicated here.
 create table if not exists public.profiles (
   user_id uuid primary key references auth.users(id) on delete cascade,
   full_name text not null check (length(btrim(full_name)) > 0 and length(full_name) <= 200),
