@@ -17,9 +17,14 @@ class DatabaseError(RuntimeError):
     """Safe persistence failure that never exposes Supabase internals."""
 
 
+class ProfileStorageError(DatabaseError):
+    """Safe profile persistence failure."""
+
+
 @dataclass(frozen=True)
 class AuthenticatedUser:
     id: UUID
+    email: str | None = None
 
 
 class SupabaseService:
@@ -43,10 +48,13 @@ class SupabaseService:
         if response.status_code != 200:
             raise AuthenticationError("Invalid or expired access token.")
         try:
-            user_id = UUID(response.json()["id"])
+            payload = response.json()
+            user_id = UUID(payload["id"])
+            email_value = payload.get("email")
+            email = email_value.strip() if isinstance(email_value, str) and email_value.strip() else None
         except (ValueError, KeyError, TypeError) as exc:
             raise AuthenticationError("Invalid access-token identity.") from exc
-        return AuthenticatedUser(id=user_id)
+        return AuthenticatedUser(id=user_id, email=email)
 
     def _request(self, method: str, path: str, token: str, **kwargs: Any) -> Any:
         headers = self._headers(token) | kwargs.pop("headers", {})
@@ -92,3 +100,43 @@ class SupabaseService:
     def delete_analysis(self, user: AuthenticatedUser, token: str, analysis_id: UUID) -> bool:
         result = self._request("DELETE", "/rest/v1/analyses", token, headers={"Prefer": "return=representation"}, params={"id": f"eq.{analysis_id}", "user_id": f"eq.{user.id}"})
         return bool(result)
+
+    def get_profile(self, user: AuthenticatedUser, token: str) -> dict[str, Any] | None:
+        try:
+            result = self._request(
+                "GET",
+                "/rest/v1/profiles",
+                token,
+                params={
+                    "select": "user_id,full_name,linkedin_url,github_url,leetcode_url,portfolio_url,created_at,updated_at",
+                    "user_id": f"eq.{user.id}",
+                    "limit": "1",
+                },
+            )
+        except DatabaseError as exc:
+            raise ProfileStorageError("Profile storage is currently unavailable.") from exc
+        return result[0] if isinstance(result, list) and result else None
+
+    def upsert_profile(self, user: AuthenticatedUser, token: str, profile: dict[str, Any]) -> dict[str, Any]:
+        record = {
+            "user_id": str(user.id),
+            "full_name": profile["full_name"],
+            "linkedin_url": profile.get("linkedin_url"),
+            "github_url": profile.get("github_url"),
+            "leetcode_url": profile.get("leetcode_url"),
+            "portfolio_url": profile.get("portfolio_url"),
+        }
+        try:
+            rows = self._request(
+                "POST",
+                "/rest/v1/profiles",
+                token,
+                headers={"Prefer": "resolution=merge-duplicates,return=representation"},
+                params={"on_conflict": "user_id"},
+                json=record,
+            )
+        except DatabaseError as exc:
+            raise ProfileStorageError("Profile storage is currently unavailable.") from exc
+        if not isinstance(rows, list) or not rows:
+            raise ProfileStorageError("Profile storage did not return a record.")
+        return rows[0]

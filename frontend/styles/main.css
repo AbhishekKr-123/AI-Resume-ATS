@@ -958,6 +958,28 @@ label,
   padding-bottom: 0.35rem;
 }
 
+.profile-section-marker {
+  margin-bottom: 0.85rem;
+}
+
+[data-testid="stTextInput"] input:disabled {
+  background: #f1f5f9;
+  border-color: var(--border);
+  color: var(--muted);
+  cursor: not-allowed;
+  opacity: 1;
+}
+
+[data-testid="stForm"]:has(.profile-section-marker) {
+  border: 0;
+  padding: 0;
+}
+
+[data-testid="stForm"]:has(.profile-section-marker) [data-testid="stFormSubmitButton"] {
+  margin: 0 auto 1rem;
+  max-width: 320px;
+}
+
 /* ================================================================
    Responsive layouts
    ================================================================ */
@@ -1023,6 +1045,15 @@ label,
   [data-testid="stHorizontalBlock"]:has(.history-pagination-marker) > [data-testid="stColumn"] {
     flex: 1 1 50% !important;
     width: 50% !important;
+  }
+
+  [data-testid="stForm"]:has(.profile-section-marker) [data-testid="stHorizontalBlock"] {
+    flex-direction: column;
+  }
+
+  [data-testid="stForm"]:has(.profile-section-marker) [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+    flex: 1 1 100% !important;
+    width: 100% !important;
   }
 
   .auth-brand h1 {

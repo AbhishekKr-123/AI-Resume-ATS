@@ -81,6 +81,12 @@ class ApiClient:
     def session(self) -> dict:
         return self._request("GET", "/auth/session", headers=self._auth_headers())
 
+    def profile(self, token: str | None) -> dict:
+        return self._request("GET", "/profile", headers=self._auth_headers(token=token))
+
+    def save_profile(self, profile: dict[str, Any], token: str | None) -> dict:
+        return self._request("PUT", "/profile", headers=self._auth_headers(token=token), json=profile)
+
     def history(self, token: str | None, limit: int = 20, offset: int = 0) -> dict:
         return self._request("GET", "/analyses", headers=self._auth_headers(token=token), params={"limit": limit, "offset": offset})
 

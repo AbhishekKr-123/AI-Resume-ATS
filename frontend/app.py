@@ -12,7 +12,7 @@ import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import streamlit as st
 
@@ -123,12 +123,51 @@ def _token_display_name(access_token: str | None) -> str | None:
     return _display_name(claims)
 
 
+def _email_display_name(email: Any) -> str | None:
+    if not isinstance(email, str) or "@" not in email:
+        return None
+    local_part = email.split("@", 1)[0]
+    words = re.sub(r"[._-]+", " ", local_part).split()
+    return " ".join(word.capitalize() for word in words) or None
+
+
 def _session_display_name() -> str | None:
+    saved_profile = st.session_state.get("saved_profile")
+    if isinstance(saved_profile, dict):
+        saved_name = _display_name(saved_profile)
+        if saved_name:
+            return saved_name
     identity = {
         key: st.session_state.get(key)
         for key in ("profile", "user_metadata", "auth_profile", "auth_user_metadata", "full_name", "name", "display_name", "auth_display_name")
     }
-    return _display_name(identity) or _token_display_name(_token())
+    return _display_name(identity) or _token_display_name(_token()) or _email_display_name(st.session_state.get("auth_email"))
+
+
+def _ensure_profile_loaded(client: ApiClient) -> None:
+    """Load the authenticated user's RLS-scoped profile once per frontend session."""
+    if not _is_authenticated() or st.session_state.get("profile_loaded"):
+        return
+    try:
+        payload = client.profile(_token())
+    except ApiError as exc:
+        st.session_state.profile_load_error = _friendly_api_error(exc)
+        st.session_state.profile_loaded = True
+        return
+    if not isinstance(payload, dict):
+        payload = {}
+    email = payload.get("email")
+    if isinstance(email, str) and email.strip():
+        st.session_state.auth_email = email.strip()
+    profile = payload.get("profile")
+    if isinstance(profile, dict):
+        st.session_state.saved_profile = profile
+        st.session_state.profile = profile
+    else:
+        st.session_state.pop("saved_profile", None)
+        st.session_state.pop("profile", None)
+    st.session_state.pop("profile_load_error", None)
+    st.session_state.profile_loaded = True
 
 
 def _asset_data_uri(path: Path, mime_type: str) -> str:
@@ -338,6 +377,8 @@ def _friendly_api_error(error: ApiError) -> str:
     if error.status_code == 401:
         clear_session(st.session_state)
         return "Your session has expired. Please sign in again."
+    if error.code == "profile_storage_unavailable":
+        return "Profile storage is currently unavailable. Please try again."
     if error.code in {"groq_not_configured", "groq_authentication_failed", "groq_rate_limited", "groq_timeout", "groq_unavailable", "invalid_feedback", "unsupported_feedback"}:
         return "AI feedback is temporarily unavailable. Your ATS analysis remains available."
     if error.status_code in {502, 503, 504}:
@@ -969,22 +1010,127 @@ def render_history(client: ApiClient) -> None:
     if next_page.button("Next", width="stretch", disabled=len(rows) < 10): st.session_state.history_offset = offset + 10; st.rerun()
 
 
-def render_profile(settings: FrontendSettings) -> None:
-    st.markdown("<div class='dashboard-header'><span>ACCOUNT</span><h1>Profile</h1><p>Review your account information and security options.</p></div>", unsafe_allow_html=True)
-    if not _is_authenticated(): st.info("You are using guest mode. Sign in to manage a profile and saved analyses."); return
+def _validate_profile_url(value: str) -> str | None:
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized) > 2048:
+        return "URL must be 2,048 characters or fewer."
+    try:
+        parsed = urlsplit(normalized)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError:
+        return "Enter a valid HTTP or HTTPS URL."
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or not hostname
+        or hostname.startswith(".")
+        or hostname.endswith(".")
+        or parsed.username
+        or parsed.password
+        or any(character.isspace() for character in normalized)
+    ):
+        return "Enter a valid HTTP or HTTPS URL."
+    return None
+
+
+def _initialize_profile_form() -> None:
+    if st.session_state.get("profile_form_initialized"):
+        return
+    profile = st.session_state.get("saved_profile")
+    record = profile if isinstance(profile, dict) else {}
+    st.session_state.profile_full_name = record.get("full_name") or _session_display_name() or ""
+    for key in ("linkedin_url", "github_url", "leetcode_url", "portfolio_url"):
+        value = record.get(key)
+        st.session_state[f"profile_{key}"] = value if isinstance(value, str) else ""
+    st.session_state.profile_form_initialized = True
+
+
+def _apply_saved_profile_to_form() -> None:
+    profile = st.session_state.pop("profile_form_saved_values", None)
+    if not isinstance(profile, dict):
+        return
+    st.session_state.profile_full_name = profile.get("full_name", "")
+    for key in ("linkedin_url", "github_url", "leetcode_url", "portfolio_url"):
+        st.session_state[f"profile_{key}"] = profile.get(key) or ""
+
+
+def render_profile(settings: FrontendSettings, client: ApiClient) -> None:
+    st.markdown("<div class='dashboard-header'><span>ACCOUNT</span><h1>Personal &amp; Developer Profile</h1><p>Keep your identity and professional links consistent across your workspace.</p></div>", unsafe_allow_html=True)
+    if not _is_authenticated():
+        st.info("You are using guest mode. Sign in to manage a profile and saved analyses.")
+        return
+    _ensure_profile_loaded(client)
+    _initialize_profile_form()
+    _apply_saved_profile_to_form()
+
+    if error := st.session_state.get("profile_load_error"):
+        st.error(error)
+    if success := st.session_state.pop("profile_save_success", None):
+        st.success(success)
+
+    email = str(st.session_state.get("auth_email", "Authenticated user"))
+    with st.form("profile_form"):
+        with st.container(border=True):
+            st.markdown("<div class='profile-section-marker card-heading'><h3>Personal Information</h3><p>Your saved display name and authenticated email.</p></div>", unsafe_allow_html=True)
+            st.text_input("Full Name", key="profile_full_name", max_chars=200)
+            st.text_input("Email", value=email, key="profile_email", disabled=True, help="Email is managed by Supabase Auth and cannot be changed here.")
+        with st.container(border=True):
+            st.markdown("<div class='profile-section-marker card-heading'><h3>Developer Profiles</h3><p>Optional links shown only in your private profile.</p></div>", unsafe_allow_html=True)
+            left, right = st.columns(2)
+            with left:
+                st.text_input("LinkedIn URL", key="profile_linkedin_url", placeholder="https://www.linkedin.com/in/username")
+                st.text_input("LeetCode URL", key="profile_leetcode_url", placeholder="https://leetcode.com/u/username")
+            with right:
+                st.text_input("GitHub URL", key="profile_github_url", placeholder="https://github.com/username")
+                st.text_input("Portfolio URL", key="profile_portfolio_url", placeholder="https://your-site.example")
+        submitted = st.form_submit_button("Save Profile", type="primary", width="stretch")
+
+    if submitted:
+        full_name = " ".join(str(st.session_state.get("profile_full_name", "")).split())
+        field_values = {
+            "linkedin_url": str(st.session_state.get("profile_linkedin_url", "")).strip(),
+            "github_url": str(st.session_state.get("profile_github_url", "")).strip(),
+            "leetcode_url": str(st.session_state.get("profile_leetcode_url", "")).strip(),
+            "portfolio_url": str(st.session_state.get("profile_portfolio_url", "")).strip(),
+        }
+        errors: list[tuple[str, str]] = []
+        if not full_name:
+            errors.append(("Full Name", "Full Name is required."))
+        labels = {"linkedin_url": "LinkedIn URL", "github_url": "GitHub URL", "leetcode_url": "LeetCode URL", "portfolio_url": "Portfolio URL"}
+        for key, value in field_values.items():
+            if message := _validate_profile_url(value):
+                errors.append((labels[key], message))
+        if errors:
+            for label, message in errors:
+                st.error(f"{label}: {message}")
+        else:
+            request = {"full_name": full_name, **{key: value or None for key, value in field_values.items()}}
+            try:
+                response = client.save_profile(request, _token())
+                profile = response.get("profile") if isinstance(response, dict) else None
+                if not isinstance(profile, dict):
+                    raise ApiError("Profile storage returned an invalid response.")
+            except ApiError as exc:
+                st.error(_friendly_api_error(exc))
+            else:
+                st.session_state.saved_profile = profile
+                st.session_state.profile = profile
+                st.session_state.profile_form_saved_values = profile
+                st.session_state.profile_save_success = "Profile saved successfully."
+                st.rerun()
+
     with st.container(border=True):
-        st.markdown("<div class='card-heading'><h3>Account information</h3><p>Your authenticated identity and available security actions.</p></div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='profile-account'><b>Email</b><br>{html.escape(str(st.session_state.get('auth_email', 'Authenticated user')))}</div>", unsafe_allow_html=True)
-        st.caption("Your access is scoped by Supabase Auth and database row-level security.")
+        st.markdown("<div class='card-heading'><h3>Account Security</h3><p>Send a password reset link to your authenticated email.</p></div>", unsafe_allow_html=True)
         auth = _auth(settings)
-        if st.button("Send password reset email") and auth:
-            try: auth.reset_password(st.session_state.get("auth_email", "")); st.success("If the account is available, a reset email has been sent.")
-            except AuthError as exc: st.error(str(exc))
-        if st.session_state.get("browser_authenticated"):
-            _render_browser_logout(settings, "profile_browser_logout")
-        elif st.button("Sign out", type="primary"):
-            if auth: auth.logout()
-            clear_session(st.session_state); st.session_state.pop("guest_mode", None); st.rerun()
+        if st.button("Send password reset email", disabled=auth is None):
+            try:
+                auth.reset_password(email)
+                st.success("If the account is available, a reset email has been sent.")
+            except AuthError as exc:
+                st.error(str(exc))
 
 
 def _css() -> None:
@@ -1030,10 +1176,12 @@ def main() -> None:
         st.success(success)
     if not _is_authenticated() and not st.session_state.get("guest_mode"):
         render_sign_in(settings); return
-    client = _client(settings); current = _page_from_query(); st.session_state.current_page = current
+    client = _client(settings)
+    _ensure_profile_loaded(client)
+    current = _page_from_query(); st.session_state.current_page = current
     with st.sidebar:
         page = _render_sidebar(settings, current)
-    {"Dashboard": lambda: render_dashboard(client), "Analyze Resume": lambda: render_analyze(settings, client), "Analysis History": lambda: render_history(client), "Profile": lambda: render_profile(settings)}[page]()
+    {"Dashboard": lambda: render_dashboard(client), "Analyze Resume": lambda: render_analyze(settings, client), "Analysis History": lambda: render_history(client), "Profile": lambda: render_profile(settings, client)}[page]()
 
 
 if __name__ == "__main__": main()

@@ -178,5 +178,13 @@ class SupabaseAuth:
 
 
 def clear_session(session_state: Any) -> None:
-    for key in ("access_token", "auth_email", "auth_csrf_token", "browser_authenticated", "auth_profile", "auth_user_metadata", "auth_display_name", "full_name", "name", "display_name", "latest_result", "latest_upload", "oauth_error", "oauth_success"):
+    for key in (
+        "access_token", "auth_email", "auth_csrf_token", "browser_authenticated", "auth_profile",
+        "auth_user_metadata", "auth_display_name", "full_name", "name", "display_name",
+        "saved_profile", "profile", "profile_loaded", "profile_load_error", "profile_form_initialized",
+        "profile_form_saved_values",
+        "profile_full_name", "profile_email", "profile_linkedin_url", "profile_github_url",
+        "profile_leetcode_url", "profile_portfolio_url", "profile_save_success",
+        "latest_result", "latest_upload", "oauth_error", "oauth_success",
+    ):
         session_state.pop(key, None)

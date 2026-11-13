@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from datetime import datetime
 import httpx
 import pytest
@@ -123,6 +124,51 @@ def history_test_app(mode: str = "populated", preselect: bool = False) -> None:
     render_history(Client())
 
 
+def profile_test_app(mode: str = "empty", auth_name: str | None = None) -> None:
+    import streamlit as st
+    from frontend.api_client import ApiError
+    from frontend.app import _ensure_profile_loaded, _render_sidebar, render_dashboard, render_profile
+    from frontend.config import FrontendSettings
+
+    saved = {
+        "user_id": "11111111-1111-1111-1111-111111111111",
+        "full_name": "Saved Profile Name",
+        "linkedin_url": "https://www.linkedin.com/in/saved",
+        "github_url": "https://github.com/saved",
+        "leetcode_url": "https://leetcode.com/u/saved",
+        "portfolio_url": "https://saved.example",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+    }
+
+    class Client:
+        def profile(self, token):
+            calls = st.session_state.get("profile_load_calls", [])
+            st.session_state.profile_load_calls = [*calls, token]
+            return {"email": "abhishek.kumar@example.test", "profile": saved if mode == "saved" else None}
+
+        def save_profile(self, profile, token):
+            st.session_state.profile_save_call = {"profile": profile, "token": token}
+            if mode == "save_failure":
+                raise ApiError("Profile storage is currently unavailable.", status_code=503, code="profile_storage_unavailable")
+            return {"email": "abhishek.kumar@example.test", "profile": {**saved, **profile}}
+
+        def history(self, token, limit=100, offset=0):
+            return {"analyses": []}
+
+    settings = FrontendSettings("https://api.test", None, None, 5 * 1024 * 1024)
+    st.session_state.access_token = "profile-token"
+    st.session_state.auth_email = "abhishek.kumar@example.test"
+    if auth_name:
+        st.session_state.auth_user_metadata = {"full_name": auth_name}
+    client = Client()
+    _ensure_profile_loaded(client)
+    with st.sidebar:
+        _render_sidebar(settings, "Profile")
+    render_profile(settings, client)
+    render_dashboard(client)
+
+
 def analyze_upload_test_app() -> None:
     from frontend.app import render_analyze
     from frontend.config import FrontendSettings
@@ -233,6 +279,24 @@ def test_api_client_forwards_only_opaque_session_cookie_when_no_bearer_token():
         session_id="opaque-session-id",
     )
     assert client.session()["authenticated"] is True
+
+
+def test_api_client_profile_load_and_save_use_authenticated_backend_contract():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.headers["authorization"] == "Bearer access-token"
+        if request.method == "GET":
+            return httpx.Response(200, json={"email": "user@example.test", "profile": None})
+        assert json.loads(request.content) == {"full_name": "User Name"}
+        return httpx.Response(200, json={"email": "user@example.test", "profile": {"full_name": "User Name"}})
+
+    client = ApiClient("https://api.test", client=httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.test"))
+    assert client.profile("access-token")["profile"] is None
+    saved = client.save_profile({"full_name": "User Name"}, "access-token")
+    assert saved["profile"]["full_name"] == "User Name"
+    assert [(request.method, request.url.path) for request in requests] == [("GET", "/profile"), ("PUT", "/profile")]
 
 
 def test_google_oauth_link_uses_same_tab_without_changing_start_endpoint():
@@ -687,8 +751,108 @@ def test_dashboard_uses_profile_display_name_and_never_greets_with_email():
 
     unnamed = AppTest.from_function(dashboard_test_app, args=(False, None)).run()
     unnamed_markup = " ".join(item.value for item in unnamed.markdown)
-    assert "Welcome back</h1>" in unnamed_markup
+    assert "Welcome back, Person</h1>" in unnamed_markup
     assert "Welcome back, person@example.test" not in unnamed_markup
+
+
+def test_new_profile_uses_email_derived_name_and_read_only_authenticated_email():
+    from frontend.app import _email_display_name
+
+    assert _email_display_name("abhishek.kumar@example.test") == "Abhishek Kumar"
+    assert _email_display_name("mary_jane-doe@example.test") == "Mary Jane Doe"
+    app = AppTest.from_function(profile_test_app, args=("empty", None)).run()
+    assert len(app.exception) == 0
+    full_name = next(field for field in app.text_input if field.label == "Full Name")
+    email = next(field for field in app.text_input if field.label == "Email")
+    assert full_name.value == "Abhishek Kumar"
+    assert email.value == "abhishek.kumar@example.test"
+    assert email.disabled is True
+    rendered = " ".join(item.value for item in app.markdown)
+    sidebar = " ".join(item.value for item in app.sidebar.markdown)
+    assert "Welcome back, Abhishek Kumar" in rendered
+    assert "Abhishek Kumar" in sidebar
+    assert app.session_state["profile_load_calls"] == ["profile-token"]
+    app.run()
+    assert app.session_state["profile_load_calls"] == ["profile-token"]
+
+
+def test_saved_profile_name_and_links_override_stale_auth_metadata_everywhere():
+    app = AppTest.from_function(profile_test_app, args=("saved", "Stale Auth Name")).run()
+    assert len(app.exception) == 0
+    values = {field.label: field.value for field in app.text_input}
+    assert values["Full Name"] == "Saved Profile Name"
+    assert values["LinkedIn URL"] == "https://www.linkedin.com/in/saved"
+    assert values["GitHub URL"] == "https://github.com/saved"
+    assert values["LeetCode URL"] == "https://leetcode.com/u/saved"
+    assert values["Portfolio URL"] == "https://saved.example"
+    rendered = " ".join(item.value for item in app.markdown)
+    sidebar = " ".join(item.value for item in app.sidebar.markdown)
+    assert "Welcome back, Saved Profile Name" in rendered
+    assert "Saved Profile Name" in sidebar
+    assert "Welcome back, Stale Auth Name" not in rendered
+
+
+def test_profile_save_updates_dashboard_sidebar_and_persists_optional_links_immediately():
+    app = AppTest.from_function(profile_test_app, args=("empty", None)).run()
+    next(field for field in app.text_input if field.label == "Full Name").input("  New   Display Name  ")
+    next(field for field in app.text_input if field.label == "LinkedIn URL").input("https://linkedin.com/in/new-name")
+    next(field for field in app.text_input if field.label == "GitHub URL").input("https://github.com/new-name")
+    next(field for field in app.text_input if field.label == "Portfolio URL").input("https://new-name.example")
+    next(button for button in app.button if button.label == "Save Profile").click().run()
+
+    assert len(app.exception) == 0
+    assert app.session_state["profile_save_call"] == {
+        "profile": {
+            "full_name": "New Display Name",
+            "linkedin_url": "https://linkedin.com/in/new-name",
+            "github_url": "https://github.com/new-name",
+            "leetcode_url": None,
+            "portfolio_url": "https://new-name.example",
+        },
+        "token": "profile-token",
+    }
+    assert app.session_state["saved_profile"]["full_name"] == "New Display Name"
+    rendered = " ".join(item.value for item in app.markdown)
+    sidebar = " ".join(item.value for item in app.sidebar.markdown)
+    assert "Welcome back, New Display Name" in rendered
+    assert "New Display Name" in sidebar
+    assert app.success[0].value == "Profile saved successfully."
+    assert app.session_state["profile_load_calls"] == ["profile-token"]
+
+
+def test_profile_rejects_empty_name_and_unsafe_urls_without_saving():
+    app = AppTest.from_function(profile_test_app, args=("empty", None)).run()
+    next(field for field in app.text_input if field.label == "Full Name").input("   ")
+    next(field for field in app.text_input if field.label == "LinkedIn URL").input("javascript:alert(1)")
+    next(field for field in app.text_input if field.label == "Portfolio URL").input("ftp://example.test/me")
+    next(button for button in app.button if button.label == "Save Profile").click().run()
+    assert len(app.exception) == 0
+    errors = [item.value for item in app.error]
+    assert "Full Name: Full Name is required." in errors
+    assert "LinkedIn URL: Enter a valid HTTP or HTTPS URL." in errors
+    assert "Portfolio URL: Enter a valid HTTP or HTTPS URL." in errors
+    assert "profile_save_call" not in app.session_state
+
+
+def test_profile_save_failure_does_not_change_resolved_dashboard_or_sidebar_name():
+    app = AppTest.from_function(profile_test_app, args=("save_failure", "Existing Session Name")).run()
+    next(field for field in app.text_input if field.label == "Full Name").input("Unsaved New Name")
+    next(button for button in app.button if button.label == "Save Profile").click().run()
+    assert len(app.exception) == 0
+    assert "saved_profile" not in app.session_state
+    rendered = " ".join(item.value for item in app.markdown)
+    sidebar = " ".join(item.value for item in app.sidebar.markdown)
+    assert "Welcome back, Existing Session Name" in rendered
+    assert "Existing Session Name" in sidebar
+    assert "Welcome back, Unsaved New Name" not in rendered
+    assert app.error[0].value == "Profile storage is currently unavailable. Please try again."
+    assert not any(item.value == "Profile saved successfully." for item in app.success)
+
+
+def test_profile_keeps_password_reset_and_has_no_duplicate_sign_out_action():
+    app = AppTest.from_function(profile_test_app, args=("empty", None)).run()
+    assert next(button for button in app.button if button.label == "Send password reset email").disabled is True
+    assert [button.label for button in app.button].count("Sign out") == 1
 
 
 def test_sidebar_omits_status_panel_and_loads_original_svg_logo():

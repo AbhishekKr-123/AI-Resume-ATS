@@ -13,12 +13,12 @@ import anyio
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from .config import ConfigurationError, Settings, load_settings
 from .auth import optional_authenticated_user, require_authenticated_user
 from .auth_routes import OAuthProvider, RedactOAuthAccessLog, SupabaseOAuthProvider, create_auth_router
-from .database_service import AuthenticatedUser, DatabaseError, SupabaseService
+from .database_service import AuthenticatedUser, DatabaseError, ProfileStorageError, SupabaseService
 from .feedback_service import FeedbackError, GroqFeedbackService
 from .ingestion import (
     IngestionError,
@@ -63,6 +63,55 @@ class ResumeAnalysisResponse(BaseModel):
 
 class ResumeFeedbackResponse(ResumeAnalysisResponse):
     feedback: dict
+
+
+class ProfileUpdateRequest(BaseModel):
+    full_name: str
+    linkedin_url: str | None = None
+    github_url: str | None = None
+    leetcode_url: str | None = None
+    portfolio_url: str | None = None
+
+    @field_validator("full_name")
+    @classmethod
+    def validate_full_name(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("Full name is required.")
+        if len(normalized) > 200:
+            raise ValueError("Full name must be 200 characters or fewer.")
+        return normalized
+
+    @field_validator("linkedin_url", "github_url", "leetcode_url", "portfolio_url", mode="before")
+    @classmethod
+    def validate_optional_url(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Profile URL must be a string.")
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if len(normalized) > 2048:
+            raise ValueError("Profile URL is too long.")
+        try:
+            parsed = urlsplit(normalized)
+            hostname = parsed.hostname
+            parsed.port
+        except ValueError as exc:
+            raise ValueError("Profile URL must be a valid HTTP or HTTPS URL.") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or not hostname
+            or hostname.startswith(".")
+            or hostname.endswith(".")
+            or parsed.username
+            or parsed.password
+            or any(character.isspace() for character in normalized)
+        ):
+            raise ValueError("Profile URL must be a valid HTTP or HTTPS URL.")
+        return normalized
 
 
 def _decode_utf8_header(value: str, label: str) -> str:
@@ -184,6 +233,10 @@ def create_app(
     @app.exception_handler(DatabaseError)
     async def database_error_handler(_: Request, __: DatabaseError) -> JSONResponse:
         return JSONResponse(status_code=503, content={"error": {"code": "storage_unavailable", "message": "Analysis storage is currently unavailable."}})
+
+    @app.exception_handler(ProfileStorageError)
+    async def profile_storage_error_handler(_: Request, __: ProfileStorageError) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"error": {"code": "profile_storage_unavailable", "message": "Profile storage is currently unavailable."}})
 
     @app.get("/health/live")
     async def liveness() -> dict[str, str]:
@@ -359,6 +412,24 @@ def create_app(
             record = await anyio.to_thread.run_sync(database.insert_analysis, user, token, analysis, sanitized_filename, feedback)
             analysis_id = record.get("id")
         return ResumeFeedbackResponse(filename=sanitized_filename, document_type=document_type, analysis=analysis, feedback=feedback, analysis_id=analysis_id)
+
+    @app.get("/profile")
+    async def get_profile(authenticated: tuple[AuthenticatedUser, str] = Depends(require_authenticated_user)) -> dict:
+        user, token = authenticated
+        database: SupabaseService | None = getattr(app.state, "supabase_service", None)
+        if database is None:
+            raise HTTPException(status_code=503, detail="Profile storage is not configured.")
+        profile = await anyio.to_thread.run_sync(database.get_profile, user, token)
+        return {"email": user.email, "profile": profile}
+
+    @app.put("/profile")
+    async def update_profile(payload: ProfileUpdateRequest, authenticated: tuple[AuthenticatedUser, str] = Depends(require_authenticated_user)) -> dict:
+        user, token = authenticated
+        database: SupabaseService | None = getattr(app.state, "supabase_service", None)
+        if database is None:
+            raise HTTPException(status_code=503, detail="Profile storage is not configured.")
+        profile = await anyio.to_thread.run_sync(database.upsert_profile, user, token, payload.model_dump())
+        return {"email": user.email, "profile": profile}
 
     @app.get("/analyses")
     async def list_analysis_history(authenticated: tuple[AuthenticatedUser, str] = Depends(require_authenticated_user), limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0)) -> dict:
